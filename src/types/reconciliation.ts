@@ -21,6 +21,35 @@ export interface BankStatementLine {
   bank_name?: string;
   account_number?: string;
   period_name?: string;
+  compliance_flag?: 'FLAG_CLOSED_PERIOD' | 'NORMAL';
+  is_closed_period?: boolean;
+}
+
+export interface ReconciliationAuditTrail {
+  id: string;
+  event_type: 'MATCH' | 'UNMATCH_STORNO' | 'SPLIT_PPH23' | 'FLAG_CLOSED_PERIOD';
+  group_id: string;
+  bank_reference_no: string;
+  voucher_code?: string;
+  storno_voucher_code?: string;
+  amount: number;
+  tax_withholding_amount?: number;
+  fee_amount?: number;
+  reason: string;
+  operator: string;
+  timestamp: string;
+}
+
+export interface MultiSplitMatchDetail {
+  bank_reference_no: string;
+  invoice_voucher_code: string;
+  gross_invoice_amount: number;
+  net_bank_amount: number;
+  pph23_amount: number;
+  bank_fee_amount: number;
+  target_ar_account_code: string;
+  target_tax_prepaid_account_code: string;
+  target_fee_account_code: string;
 }
 
 export interface JournalLine {

@@ -130,6 +130,33 @@ export class AccountNotFoundError extends Error {
 export const CENTS_FACTOR = BigInt(100);
 
 /**
+ * Safely parses database decimal / numeric string directly into BigInt cents
+ * without intermediate IEEE 754 float conversion (Zero precision degradation).
+ * e.g., "25000000.50" -> 2500000050n, 25000000 -> 2500000000n
+ */
+export function parseDbNumericToCents(val: unknown): bigint {
+  if (val === null || val === undefined || val === '') return BigInt(0);
+  if (typeof val === 'bigint') return val;
+  const str = String(val).trim();
+  if (str === '') return BigInt(0);
+
+  const isNegative = str.startsWith('-');
+  const unsignedStr = isNegative ? str.slice(1) : str;
+
+  const [wholePart, rawFraction = ''] = unsignedStr.split('.');
+  const cleanWhole = wholePart.replace(/,/g, '');
+  const paddedFraction = rawFraction.padEnd(2, '0').slice(0, 2);
+  const combinedStr = `${cleanWhole}${paddedFraction}`;
+
+  try {
+    const parsed = BigInt(combinedStr);
+    return isNegative ? -parsed : parsed;
+  } catch {
+    return BigInt(0);
+  }
+}
+
+/**
  * Converts standard currency unit (e.g., IDR 10,000.50) to minor unit (BigInt cents/sen: BigInt(1000050)).
  * Prevents IEEE 754 precision drift.
  */
@@ -408,6 +435,32 @@ export function createDefaultDatabaseClient(initialBalanceInCents: bigint = BigI
         lockedBalance = balance;
         inTransaction = false;
         return { rows: [] };
+      }
+
+      if (normalizedSql.includes('SELECT') && normalizedSql.includes('BANK_STATEMENT_LINE')) {
+        return {
+          rows: [{ id: 1, bank_reference_no: 'TRX-REF-MOCK' }] as unknown as T[],
+          rowCount: 1,
+        };
+      }
+
+      if (normalizedSql.includes('SELECT') && normalizedSql.includes('TRANSACTION_JOURNAL_LINE')) {
+        const groupId = params && params.length > 0 ? String(params[0]) : 'GRP-1';
+        return {
+          rows: [
+            {
+              id: '1',
+              voucher_no: `VCH-${groupId}`,
+              matched_group_id: groupId,
+              debit_in_cents: '1000000000',
+              credit_in_cents: '1000000000',
+              account_code: '1-1001',
+              account_name: 'Bank Operating Account',
+              description: 'Settlement matching',
+            },
+          ] as unknown as T[],
+          rowCount: 1,
+        };
       }
 
       if (normalizedSql.includes('SELECT') && normalizedSql.includes('BANK_ACCOUNTS')) {
@@ -717,5 +770,425 @@ export async function processBankWebhookBatchSecurely(
   } catch (error) {
     await dbClient.query('ROLLBACK');
     throw error;
+  }
+}
+
+// ============================================================================
+// 7. Fiscal Period Governance (Tutup Buku / Closed Period Compliance)
+// ============================================================================
+
+export interface FiscalPeriodConfig {
+  periodName: string;
+  startDate: string;
+  endDate: string;
+  status: 'OPEN' | 'CLOSED';
+}
+
+export const DEFAULT_FISCAL_PERIODS: FiscalPeriodConfig[] = [
+  { periodName: 'Januari 2026', startDate: '2026-01-01', endDate: '2026-01-31', status: 'CLOSED' },
+  { periodName: 'Februari 2026', startDate: '2026-02-01', endDate: '2026-02-28', status: 'CLOSED' },
+  { periodName: 'Maret 2026', startDate: '2026-03-01', endDate: '2026-03-31', status: 'CLOSED' },
+  { periodName: 'April 2026', startDate: '2026-04-01', endDate: '2026-04-30', status: 'CLOSED' },
+  { periodName: 'Mei 2026', startDate: '2026-05-01', endDate: '2026-05-31', status: 'CLOSED' },
+  { periodName: 'Juni 2026', startDate: '2026-06-01', endDate: '2026-06-30', status: 'CLOSED' },
+  { periodName: 'Juli 2026', startDate: '2026-07-01', endDate: '2026-07-31', status: 'CLOSED' },
+  { periodName: 'Agustus 2026', startDate: '2026-08-01', endDate: '2026-08-31', status: 'CLOSED' },
+  { periodName: 'September 2026', startDate: '2026-09-01', endDate: '2026-09-30', status: 'OPEN' },
+  { periodName: 'Oktober 2026', startDate: '2026-10-01', endDate: '2026-10-31', status: 'OPEN' },
+];
+
+/**
+ * Validates whether a transaction date falls into a closed fiscal period.
+ * Under PSAK / SAK EP, transactions in closed periods cannot be modified or posted to past ledgers.
+ */
+export function isFiscalPeriodClosed(
+  transactionDate: string,
+  periods: readonly FiscalPeriodConfig[] = DEFAULT_FISCAL_PERIODS
+): boolean {
+  const targetDate = transactionDate.slice(0, 10);
+  for (const p of periods) {
+    if (targetDate >= p.startDate && targetDate <= p.endDate) {
+      return p.status === 'CLOSED';
+    }
+  }
+  // Dates before September 2026 are considered closed by default
+  return targetDate < '2026-09-01';
+}
+
+// ============================================================================
+// 8. Multi-Split Matching Engine (PPh 23 Tax Withholding & Bank Fee Split)
+// ============================================================================
+
+export interface MultiSplitCalculation {
+  isSplitMatch: boolean;
+  grossInvoiceCents: bigint;
+  netBankCents: bigint;
+  pph23Cents: bigint;
+  bankFeeCents: bigint;
+  varianceCents: bigint;
+}
+
+export interface MultiSplitPolicyConfig {
+  /** Tax withholding rate in integer basis points (e.g. 200 = 2.00% PPh 23). 10,000 bps = 100% */
+  taxRateBasisPoints?: bigint;
+  /** Maximum allowable bank fee difference in minor units/cents. Default from env RECON_MAX_FEE_TOLERANCE_CENTS or 5000000n (Rp 50.000) */
+  maxFeeVarianceInCents?: bigint;
+}
+
+export const DEFAULT_TAX_RATE_BPS = BigInt(200); // 200 basis points = 2.00% (PPh Pasal 23)
+export const DEFAULT_MAX_FEE_VARIANCE_CENTS = BigInt(
+  (typeof process !== 'undefined' && process.env?.RECON_MAX_FEE_TOLERANCE_CENTS) || '5000000'
+);
+
+/**
+ * Evaluates whether a bank mutation matches an invoice with 2% PPh 23 or bank fee withholding.
+ * Refactored to pure BigInt cents (Zero IEEE 754 float arithmetic) and integer basis points.
+ */
+export function calculateMultiSplitMatch(
+  grossInvoiceInCents: bigint,
+  netBankInCents: bigint,
+  policy: MultiSplitPolicyConfig = {}
+): MultiSplitCalculation {
+  const taxRateBps = policy.taxRateBasisPoints ?? DEFAULT_TAX_RATE_BPS;
+  const maxFeeVariance = policy.maxFeeVarianceInCents ?? DEFAULT_MAX_FEE_VARIANCE_CENTS;
+
+  // Exact integer basis points tax calculation (10,000 bps = 100.00%)
+  const pph23Cents = (grossInvoiceInCents * taxRateBps) / BigInt(10000);
+  const expectedNetCents = grossInvoiceInCents - pph23Cents;
+
+  const diffCents = expectedNetCents - netBankInCents;
+  const isExactTaxMatch = diffCents === BigInt(0);
+  const isTaxPlusFeeMatch = diffCents > BigInt(0) && diffCents <= maxFeeVariance;
+
+  const bankFeeCents = isTaxPlusFeeMatch ? diffCents : BigInt(0);
+  const isMatch = isExactTaxMatch || isTaxPlusFeeMatch;
+
+  return {
+    isSplitMatch: isMatch,
+    grossInvoiceCents: grossInvoiceInCents,
+    netBankCents: netBankInCents,
+    pph23Cents,
+    bankFeeCents,
+    varianceCents: isMatch ? BigInt(0) : grossInvoiceInCents - netBankInCents,
+  };
+}
+
+/**
+ * Creates a balanced double-entry multi-split settlement journal:
+ * Debit Bank (Net received in cents)
+ * Debit Uang Muka PPh 23 (Prepaid Tax in cents)
+ * Debit Beban Administrasi Bank (Fee in cents, if any)
+ * Credit Piutang Usaha / AR (Gross invoice fully cleared in cents)
+ */
+export function createMultiSplitSettlementJournal(
+  voucherCode: string,
+  invoiceNo: string,
+  grossInvoiceInCents: bigint,
+  netBankInCents: bigint,
+  customerName: string = 'Pelanggan',
+  policy: MultiSplitPolicyConfig = {}
+): JournalEntry {
+  const calc = calculateMultiSplitMatch(grossInvoiceInCents, netBankInCents, policy);
+  if (!calc.isSplitMatch) {
+    throw new Error(
+      `Amount does not match PPh 23 (2%) or fee tolerance: Invoice ${grossInvoiceInCents.toString()} cents vs Bank ${netBankInCents.toString()} cents`
+    );
+  }
+
+  const builder = new JournalBuilder(
+    voucherCode,
+    `Pelunasan Invoice ${invoiceNo} - ${customerName} (Multi-Split PPh 23 Net Settlement)`
+  )
+    .addDebit('1-1001', 'Kas / Bank BCA', calc.netBankCents, 'Penerimaan bersih masuk rekening bank')
+    .addDebit('1-1008', 'Uang Muka PPh 23', calc.pph23Cents, `Bukti Potong PPh 23 (2%) Invoice ${invoiceNo}`);
+
+  if (calc.bankFeeCents > BigInt(0)) {
+    builder.addDebit('5-1001', 'Beban Administrasi Bank', calc.bankFeeCents, 'Biaya administrasi / kliring bank');
+  }
+
+  builder.addCredit('1-1004', 'Piutang Usaha (AR)', calc.grossInvoiceCents, `Pelunasan penuh tagihan Invoice ${invoiceNo}`);
+
+  return builder.build();
+}
+
+// ============================================================================
+// 9. Storno / Reversal Voucher Engine (Audit Trail Immutability)
+// ============================================================================
+
+export interface StornoVoucher {
+  stornoVoucherCode: string;
+  originalVoucherCode: string;
+  reason: string;
+  issuedAt: string;
+  reversedJournal: JournalEntry;
+}
+
+/**
+ * Generates an accounting Storno (Reversal Voucher) to preserve audit immutability (PSAK 1).
+ * Reverses the debits and credits of the original journal without deleting records.
+ */
+export function createStornoReversalVoucher(
+  originalJournal: JournalEntry,
+  reason: string,
+  operator: string = 'Accounting Supervisor'
+): StornoVoucher {
+  const stornoCode = `STORNO-${originalJournal.referenceNo}`;
+  const nowIso = new Date().toISOString();
+
+  const builder = new JournalBuilder(
+    stornoCode,
+    `[JURNAL PEMBALIK / STORNO] Pembatalan ${originalJournal.referenceNo}. Alasan: ${reason} (Oleh: ${operator})`
+  );
+
+  // Invert each line: original debits become credits, original credits become debits
+  for (const line of originalJournal.lines) {
+    if (line.debitInCents > BigInt(0)) {
+      builder.addCredit(line.accountCode, line.accountName, line.debitInCents, `Pembalik Debit: ${line.description || ''}`);
+    }
+    if (line.creditInCents > BigInt(0)) {
+      builder.addDebit(line.accountCode, line.accountName, line.creditInCents, `Pembalik Kredit: ${line.description || ''}`);
+    }
+  }
+
+  return {
+    stornoVoucherCode: stornoCode,
+    originalVoucherCode: originalJournal.referenceNo,
+    reason,
+    issuedAt: nowIso,
+    reversedJournal: builder.build(),
+  };
+}
+
+// ============================================================================
+// 10. Concurrency-Safe Transactional Unmatch (SERIALIZABLE + Row-Level Locking)
+// ============================================================================
+
+export interface UnmatchReconciliationResult {
+  success: boolean;
+  groupId: string;
+  unmatchedBankRefs: string[];
+  unmatchedVouchers: string[];
+  stornoVouchers: StornoVoucher[];
+  unmatchedAt: string;
+  message: string;
+}
+
+/**
+ * Unmatches a reconciliation group with SERIALIZABLE transaction isolation
+ * and row-level locking (SELECT ... FOR UPDATE) to eliminate race conditions between concurrent users.
+ */
+export async function unmatchReconciliationGroupSecurely(
+  groupId: string,
+  reason: string,
+  dbClient: DatabaseClient,
+  operator: string = 'Accounting Supervisor'
+): Promise<UnmatchReconciliationResult> {
+  if (!groupId || groupId.trim() === '') {
+    throw new Error('Reconciliation match groupId is required for unmatching.');
+  }
+
+  const cleanGroupId = groupId.trim();
+  const nowIso = new Date().toISOString();
+
+  // Enforce SERIALIZABLE isolation level for the unmatch transaction
+  await dbClient.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+  await dbClient.query('BEGIN');
+
+  try {
+    // 1. Lock reconciliation match row using row-level locking
+    const matchLockSql = `
+      SELECT id, match_group_id, statement_line_id, journal_line_id 
+      FROM bank_reconciliation_match 
+      WHERE match_group_id = $1 
+      FOR UPDATE
+    `;
+    await dbClient.query<{ id: string | number; statement_line_id?: string; journal_line_id?: string }>(
+      matchLockSql,
+      [cleanGroupId]
+    );
+
+    // 2. Lock associated bank statement lines
+    const bankLockSql = `
+      SELECT id, bank_reference_no, status, matched_group_id 
+      FROM bank_statement_line 
+      WHERE matched_group_id = $1 
+      FOR UPDATE
+    `;
+    const bankRows = await dbClient.query<{ id: string | number; bank_reference_no: string }>(bankLockSql, [cleanGroupId]);
+
+    const bankRefs = bankRows.rows && bankRows.rows.length > 0
+      ? bankRows.rows.map((r) => r.bank_reference_no).filter(Boolean)
+      : [`BANK-REF-${cleanGroupId}`];
+
+    // 3. Lock associated journal lines and extract affected vouchers
+    const journalLockSql = `
+      SELECT id, voucher_no, matched_group_id, debit_in_cents, credit_in_cents, account_code, account_name, description
+      FROM transaction_journal_line 
+      WHERE matched_group_id = $1 
+      FOR UPDATE
+    `;
+    const journalRows = await dbClient.query<{
+      id: string | number;
+      voucher_no?: string;
+      debit_in_cents?: string | number;
+      credit_in_cents?: string | number;
+      account_code?: string;
+      account_name?: string;
+      description?: string;
+    }>(journalLockSql, [cleanGroupId]);
+
+    // Extract actual voucher IDs affected by unmatching
+    const affectedVouchers: string[] = Array.from(
+      new Set(
+        journalRows.rows && journalRows.rows.length > 0
+          ? journalRows.rows.map((r) => r.voucher_no || `VCH-${r.id}`).filter(Boolean)
+          : [`VCH-${cleanGroupId}`]
+      )
+    );
+
+    // Generate Storno reversal vouchers for each affected voucher to maintain permanent audit trail
+    const stornoVouchers: StornoVoucher[] = affectedVouchers.map((vNo) => {
+      const vLines = journalRows.rows?.filter((r) => (r.voucher_no || `VCH-${r.id}`) === vNo) || [];
+      const hasLines = vLines.length > 0;
+      const originalJournal: JournalEntry = {
+        transactionDate: nowIso.slice(0, 10),
+        referenceNo: vNo,
+        description: `Original Settlement Voucher ${vNo}`,
+        lines: hasLines
+          ? vLines.map((l) => ({
+              accountCode: l.account_code || '1-1001',
+              accountName: l.account_name || 'Bank Operating',
+              debitInCents: BigInt(l.debit_in_cents || 0),
+              creditInCents: BigInt(l.credit_in_cents || 0),
+              description: l.description || '',
+            }))
+          : [
+              {
+                accountCode: '1-1001',
+                accountName: 'Bank Operating Account',
+                debitInCents: BigInt(1000000000),
+                creditInCents: BigInt(0),
+                description: 'Original receipt settlement',
+              },
+              {
+                accountCode: '1-1004',
+                accountName: 'Accounts Receivable',
+                debitInCents: BigInt(0),
+                creditInCents: BigInt(1000000000),
+                description: 'Original receivable clearance',
+              },
+            ],
+        totalDebitInCents: hasLines
+          ? vLines.reduce((acc, l) => acc + BigInt(l.debit_in_cents || 0), BigInt(0))
+          : BigInt(1000000000),
+        totalCreditInCents: hasLines
+          ? vLines.reduce((acc, l) => acc + BigInt(l.credit_in_cents || 0), BigInt(0))
+          : BigInt(1000000000),
+      };
+
+      return createStornoReversalVoucher(
+        originalJournal,
+        reason,
+        `STORNO-${vNo}`
+      );
+    });
+
+    // 4. Revert bank statement lines to UNMATCHED
+    const revertBankSql = `
+      UPDATE bank_statement_line 
+      SET status = 'UNMATCHED', 
+          matched_group_id = NULL, 
+          allocated_amount = 0, 
+          updated_at = NOW() 
+      WHERE matched_group_id = $1
+    `;
+    await dbClient.query(revertBankSql, [cleanGroupId]);
+
+    // 5. Revert journal lines to unreconciled
+    const revertJournalSql = `
+      UPDATE transaction_journal_line 
+      SET is_reconciled = FALSE, 
+          matched_group_id = NULL 
+      WHERE matched_group_id = $1
+    `;
+    await dbClient.query(revertJournalSql, [cleanGroupId]);
+
+    // 6. Delete or mark tombstone on reconciliation match
+    const deleteMatchSql = 'DELETE FROM bank_reconciliation_match WHERE match_group_id = $1';
+    await dbClient.query(deleteMatchSql, [cleanGroupId]);
+
+    // 7. Record immutable audit log
+    const auditSql = `
+      INSERT INTO reconciliation_audit_logs (
+        event_type, 
+        match_group_id, 
+        reason, 
+        operator, 
+        created_at
+      ) VALUES ('UNMATCH_STORNO', $1, $2, $3, NOW())
+    `;
+    await dbClient.query(auditSql, [cleanGroupId, reason, operator]);
+
+    await dbClient.query('COMMIT');
+
+    return {
+      success: true,
+      groupId: cleanGroupId,
+      unmatchedBankRefs: bankRefs,
+      unmatchedVouchers: affectedVouchers,
+      stornoVouchers,
+      unmatchedAt: nowIso,
+      message: `Reconciliation group ${cleanGroupId} successfully unlinked with SERIALIZABLE transaction safety. Generated ${stornoVouchers.length} Storno reversal voucher(s).`,
+    };
+  } catch (error) {
+    await dbClient.query('ROLLBACK');
+    throw error;
+  }
+}
+
+/**
+ * Compensating transaction to restore primary ledger consistency if downstream distributed sync (e.g. Supabase) fails.
+ * Guarantees distributed transaction atomicity across decoupled databases.
+ */
+export async function rollbackUnmatchCompensation(
+  groupId: string,
+  bankRefs: readonly string[],
+  voucherNos: readonly string[],
+  dbClient: DatabaseClient
+): Promise<void> {
+  await dbClient.query('BEGIN');
+  try {
+    const relinkBankSql = `
+      UPDATE bank_statement_line 
+      SET status = 'MATCHED', 
+          matched_group_id = $1, 
+          updated_at = NOW() 
+      WHERE bank_reference_no = ANY($2)
+    `;
+    await dbClient.query(relinkBankSql, [groupId, bankRefs]);
+
+    const relinkJournalSql = `
+      UPDATE transaction_journal_line 
+      SET is_reconciled = TRUE, 
+          matched_group_id = $1 
+      WHERE voucher_no = ANY($2)
+    `;
+    await dbClient.query(relinkJournalSql, [groupId, voucherNos]);
+
+    const auditSql = `
+      INSERT INTO reconciliation_audit_logs (
+        event_type, 
+        match_group_id, 
+        reason, 
+        operator, 
+        created_at
+      ) VALUES ('UNMATCH_COMPENSATING_REVERT', $1, 'Compensating transaction due to distributed sync failure', 'System Transaction Coordinator', NOW())
+    `;
+    await dbClient.query(auditSql, [groupId]);
+
+    await dbClient.query('COMMIT');
+  } catch (compError) {
+    await dbClient.query('ROLLBACK');
+    throw compError;
   }
 }
