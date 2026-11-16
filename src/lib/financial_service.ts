@@ -62,6 +62,15 @@ export interface WebhookProcessingResult {
   processedAt: string;
 }
 
+export interface BatchWebhookProcessingResult {
+  success: boolean;
+  batchId: string;
+  totalCount: number;
+  idempotentReplaysCount: number;
+  results: WebhookProcessingResult[];
+  processedAt: string;
+}
+
 export interface DatabaseQueryResult<T = Record<string, unknown>> {
   rows: T[];
   rowCount?: number;
@@ -402,10 +411,14 @@ export function createDefaultDatabaseClient(initialBalanceInCents: bigint = BigI
       }
 
       if (normalizedSql.includes('SELECT') && normalizedSql.includes('BANK_ACCOUNTS')) {
-        // Simulates SELECT balance_in_cents FROM bank_accounts WHERE account_number = $1 FOR UPDATE
+        // Simulates single or batched: SELECT account_number, balance_in_cents FROM bank_accounts ... FOR UPDATE
+        const accountsToReturn = params && params.length > 0 ? (params as readonly string[]) : ['ACC-1'];
         return {
-          rows: [{ balance_in_cents: (inTransaction ? lockedBalance : balance).toString() } as unknown as T],
-          rowCount: 1,
+          rows: accountsToReturn.map((acc) => ({
+            account_number: acc,
+            balance_in_cents: (inTransaction ? lockedBalance : balance).toString(),
+          })) as unknown as T[],
+          rowCount: accountsToReturn.length,
         };
       }
 
@@ -524,6 +537,183 @@ export async function processBankWebhookSecurely(
     await idempotencyStore.set(cleanReferenceId, result);
 
     return result;
+  } catch (error) {
+    await dbClient.query('ROLLBACK');
+    throw error;
+  }
+}
+
+/**
+ * ⚡ BATCHED CONCURRENCY-SAFE WEBHOOK PROCESSOR
+ * Eliminates O(N) sequential transactions and prevents database connection pool exhaustion.
+ * 
+ * Architecture:
+ * 1. Single Unified Transaction: Opens exactly ONE database transaction (BEGIN ... COMMIT) for the whole batch.
+ * 2. Pre-flight Idempotency Check: Rapidly resolves cached items without DB locks.
+ * 3. Deadlock-Free Batch Locking: Sorts affected account keys and locks them in a single query:
+ *    SELECT account_number, balance_in_cents FROM bank_accounts WHERE account_number IN (...) ORDER BY account_number FOR UPDATE
+ * 4. Net Delta Aggregation: Consolidates updates per account (O(M) distinct accounts instead of O(N) operations).
+ * 5. Atomic Batch Sync Timestamp: Updates last_sync_at and balance inside the single transaction.
+ */
+export async function processBankWebhookBatchSecurely(
+  payloads: readonly BankWebhookPayload[],
+  dbClient: DatabaseClient,
+  idempotencyStore: IdempotencyStore = defaultIdempotencyStore
+): Promise<BatchWebhookProcessingResult> {
+  const batchId = `BATCH-${Date.now()}`;
+  const nowIso = new Date().toISOString();
+
+  if (payloads.length === 0) {
+    return {
+      success: true,
+      batchId,
+      totalCount: 0,
+      idempotentReplaysCount: 0,
+      results: [],
+      processedAt: nowIso,
+    };
+  }
+
+  // 1. Fast-path: Deduplicate and check idempotency store for existing records
+  const results: WebhookProcessingResult[] = [];
+  const pendingPayloads: BankWebhookPayload[] = [];
+  let idempotentReplaysCount = 0;
+
+  for (const p of payloads) {
+    if (!p.reference_id || typeof p.reference_id !== 'string' || p.reference_id.trim() === '') {
+      throw new MissingIdempotencyKeyError();
+    }
+
+    const cleanRef = p.reference_id.trim();
+    const cached = await idempotencyStore.get(cleanRef);
+    if (cached) {
+      results.push({ ...cached, isIdempotentReplay: true });
+      idempotentReplaysCount++;
+    } else {
+      pendingPayloads.push({ ...p, reference_id: cleanRef });
+    }
+  }
+
+  // If all items were replayed idempotently, return immediately without opening a DB transaction
+  if (pendingPayloads.length === 0) {
+    return {
+      success: true,
+      batchId,
+      totalCount: payloads.length,
+      idempotentReplaysCount,
+      results,
+      processedAt: nowIso,
+    };
+  }
+
+  // 2. Aggregate net delta per account and sort account keys to prevent PostgreSQL deadlocks
+  const accountDeltas = new Map<string, bigint>();
+  for (const p of pendingPayloads) {
+    const delta = toCents(p.amount);
+    const current = accountDeltas.get(p.account_number) || BigInt(0);
+    accountDeltas.set(p.account_number, current + delta);
+  }
+
+  const sortedAccounts = Array.from(accountDeltas.keys()).sort();
+
+  // 3. Execute ONE single ACID transaction for the entire batch
+  await dbClient.query('BEGIN');
+  try {
+    // 3a. Single batched row-locking query
+    const placeholders = sortedAccounts.map((_, i) => `$${i + 1}`).join(', ');
+    const lockSql = `
+      SELECT account_number, balance_in_cents 
+      FROM bank_accounts 
+      WHERE account_number IN (${placeholders}) 
+      ORDER BY account_number FOR UPDATE
+    `;
+    const lockResult = await dbClient.query<{ account_number: string; balance_in_cents: string | number }>(
+      lockSql,
+      sortedAccounts
+    );
+
+    const accountBalances = new Map<string, bigint>();
+    if (lockResult.rows) {
+      for (const row of lockResult.rows) {
+        accountBalances.set(row.account_number, BigInt(row.balance_in_cents));
+      }
+    }
+
+    for (const acc of sortedAccounts) {
+      if (!accountBalances.has(acc)) {
+        throw new AccountNotFoundError(acc);
+      }
+    }
+
+    // 3b. Compute running balances and per-item progression
+    const runningBalances = new Map<string, bigint>(accountBalances);
+    const newItemsResults: WebhookProcessingResult[] = [];
+
+    for (const p of pendingPayloads) {
+      const delta = toCents(p.amount);
+      const current = runningBalances.get(p.account_number)!;
+      const updated = current + delta;
+      runningBalances.set(p.account_number, updated);
+
+      newItemsResults.push({
+        success: true,
+        isIdempotentReplay: false,
+        referenceId: p.reference_id,
+        accountNumber: p.account_number,
+        newBalanceInCents: updated,
+        newBalanceFormatted: formatIDRFromCents(updated),
+        processedAt: nowIso,
+      });
+    }
+
+    // 3c. Update aggregated balance and sync timestamp for each distinct account
+    for (const acc of sortedAccounts) {
+      const finalBalance = runningBalances.get(acc)!;
+      const updateSql = `
+        UPDATE bank_accounts 
+        SET balance_in_cents = $1, 
+            last_mutation_at = NOW(), 
+            last_sync_at = NOW() 
+        WHERE account_number = $2
+      `;
+      await dbClient.query(updateSql, [finalBalance.toString(), acc]);
+    }
+
+    // 3d. Batched ledger audit logs
+    for (const res of newItemsResults) {
+      const auditSql = `
+        INSERT INTO bank_webhook_logs (
+          reference_id, 
+          account_number, 
+          amount_in_cents, 
+          balance_after_in_cents, 
+          status
+        ) VALUES ($1, $2, $3, $4, 'PROCESSED')
+      `;
+      await dbClient.query(auditSql, [
+        res.referenceId,
+        res.accountNumber,
+        res.newBalanceInCents.toString(),
+        res.newBalanceInCents.toString(),
+      ]);
+    }
+
+    await dbClient.query('COMMIT');
+
+    // 4. Cache processed results in idempotency store
+    for (const res of newItemsResults) {
+      await idempotencyStore.set(res.referenceId, res);
+      results.push(res);
+    }
+
+    return {
+      success: true,
+      batchId,
+      totalCount: payloads.length,
+      idempotentReplaysCount,
+      results,
+      processedAt: nowIso,
+    };
   } catch (error) {
     await dbClient.query('ROLLBACK');
     throw error;
