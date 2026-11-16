@@ -10,6 +10,7 @@ import {
 import {
   calculateMultiSplitMatch,
   fromCents,
+  toCents,
 } from '@/lib/financial_service';
 import {
   INITIAL_SESSION,
@@ -847,7 +848,7 @@ export default function BankReconciliationPage() {
         if (j.is_reconciled || isSplitTargetJournal(j)) return false;
         if (j.type !== bank.mutation_type) return false;
 
-        const calc = calculateMultiSplitMatch(j.amount, bank.amount);
+        const calc = calculateMultiSplitMatch(toCents(j.amount), toCents(bank.amount));
         return calc.isSplitMatch;
       });
 
@@ -855,7 +856,7 @@ export default function BankReconciliationPage() {
         matchCount++;
         const targetJ = currentJournalLines[foundIdx];
         const groupId = generateUUID();
-        const calc = calculateMultiSplitMatch(targetJ.amount, bank.amount);
+        const calc = calculateMultiSplitMatch(toCents(targetJ.amount), toCents(bank.amount));
 
         currentJournalLines[foundIdx] = {
           ...targetJ,
@@ -1380,6 +1381,23 @@ export default function BankReconciliationPage() {
       `Berhasil membatalkan rekonsiliasi. Jurnal Pembalik (Storno Voucher) telah diterbitkan dan transaksi bank kembali ke status Belum Cocok (Audit Trail terjaga).`
     );
     setTimeout(() => setBannerMessage(null), 4500);
+
+    // Backend transactional unmatch with SERIALIZABLE isolation and row-level locking (SELECT FOR UPDATE)
+    (async () => {
+      try {
+        await fetch('/api/reconciliation/unmatch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            group_id: groupId,
+            reason: 'Pembatalan rekonsiliasi via UI',
+            operator: 'Accounting Operator',
+          }),
+        });
+      } catch (e) {
+        console.warn('Transactional unmatch notification warning:', e);
+      }
+    })();
 
     // Sync unmatch to Supabase Cloud Database (including bank_reconciliation_match deletion)
     if (isSupabaseConfigured && supabase) {

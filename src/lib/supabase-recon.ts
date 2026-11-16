@@ -1,5 +1,5 @@
 import { supabase, isSupabaseConfigured } from './supabase';
-import { isFiscalPeriodClosed } from './financial_service';
+import { isFiscalPeriodClosed, fromCents, parseDbNumericToCents } from './financial_service';
 import {
   AccountSubCategory,
   BankStatementLine,
@@ -70,13 +70,14 @@ export async function fetchBankStatementLinesFromSupabase(): Promise<BankStateme
     .select('match_group_id, statement_line_id, matched_amount');
 
   const matchMap = new Map<number, string>();
-  const matchSumMap = new Map<number, number>();
+  const matchSumMap = new Map<number, bigint>();
   if (matchData) {
     for (const m of matchData) {
       if (m.statement_line_id) {
         const sId = Number(m.statement_line_id);
         if (m.match_group_id) matchMap.set(sId, m.match_group_id);
-        matchSumMap.set(sId, (matchSumMap.get(sId) || 0) + Number(m.matched_amount || 0));
+        const currentSum = matchSumMap.get(sId) || BigInt(0);
+        matchSumMap.set(sId, currentSum + parseDbNumericToCents(m.matched_amount));
       }
     }
   }
@@ -86,9 +87,12 @@ export async function fetchBankStatementLinesFromSupabase(): Promise<BankStateme
     const bankAccount = Array.isArray(rawBankAcc) ? (rawBankAcc[0] as Record<string, string>) : (rawBankAcc as Record<string, string>);
     const sId = Number(row.id);
     const matchGroupId = matchMap.get(sId);
-    const allocated = matchSumMap.get(sId) || 0;
-    const totalAmt = Number(row.amount);
-    const remaining = Math.max(0, totalAmt - allocated);
+    
+    // Parse database decimal/numeric types directly into BigInt cents (Zero precision loss)
+    const totalAmtCents = parseDbNumericToCents(row.amount);
+    const allocatedCents = matchSumMap.get(sId) || BigInt(0);
+    const remainingCents = totalAmtCents > allocatedCents ? totalAmtCents - allocatedCents : BigInt(0);
+    const balanceAfterCents = parseDbNumericToCents(row.balance_after);
     const txDate = String(row.transaction_date || '');
 
     return {
@@ -96,10 +100,10 @@ export async function fetchBankStatementLinesFromSupabase(): Promise<BankStateme
       transaction_date: txDate,
       value_date: String(row.value_date || txDate),
       mutation_type: (String(row.mutation_type || 'CR').toUpperCase() === 'DB' ? 'DB' : 'CR') as BankStatementLine['mutation_type'],
-      amount: totalAmt,
-      remaining_amount: row.status === 'PARTIALLY_MATCHED' ? remaining : (row.status === 'MATCHED' ? 0 : totalAmt),
-      allocated_amount: allocated,
-      balance_after: Number(row.balance_after || 0),
+      amount: fromCents(totalAmtCents),
+      remaining_amount: row.status === 'PARTIALLY_MATCHED' ? fromCents(remainingCents) : (row.status === 'MATCHED' ? 0 : fromCents(totalAmtCents)),
+      allocated_amount: fromCents(allocatedCents),
+      balance_after: fromCents(balanceAfterCents),
       bank_reference_no: String(row.bank_reference_no || ''),
       description: String(row.description || ''),
       status: String(row.status || 'UNMATCHED') as BankStatementLine['status'],
@@ -188,8 +192,8 @@ export async function fetchJournalLinesFromSupabase(): Promise<JournalLine[]> {
         account_code: mbbs?.kd_bbs || (l.line_no === 1 ? (masterBbs?.kd_bbs || '111-201') : '112-100'),
         account_name: mbbs?.nama_bbs || (typeof l.line_description === 'string' ? l.line_description : 'Akun GL'),
         line_description: String(l.line_description || row.description || ''),
-        debit_amount: Number(l.debit_amount || 0),
-        credit_amount: Number(l.credit_amount || 0),
+        debit_amount: fromCents(parseDbNumericToCents(l.debit_amount)),
+        credit_amount: fromCents(parseDbNumericToCents(l.credit_amount)),
         is_reconciled: Boolean(l.is_reconciled),
       };
     });
@@ -203,7 +207,7 @@ export async function fetchJournalLinesFromSupabase(): Promise<JournalLine[]> {
       account_name: typeof bankLine?.line_description === 'string' ? bankLine.line_description : (masterBbs?.nama_bbs || 'Bank Mandiri Giro Operasional'),
       description: String(row.description || ''),
       type: isDebit ? 'CR' : 'DB',
-      amount: Number(row.total_amount),
+      amount: fromCents(parseDbNumericToCents(row.total_amount)),
       is_reconciled: isReconciled,
       period_name: getPeriodNameFromDate(txDate),
       lines: mappedLines,
@@ -393,8 +397,8 @@ export async function fetchFinancialJournalsFromSupabase(
         account_code: mbbs?.kd_bbs || '111-201',
         account_name: mbbs?.nama_bbs || (typeof l.line_description === 'string' ? l.line_description : 'Akun GL'),
         line_description: String(l.line_description || row.description || ''),
-        debit_amount: Number(l.debit_amount || 0),
-        credit_amount: Number(l.credit_amount || 0),
+        debit_amount: fromCents(parseDbNumericToCents(l.debit_amount)),
+        credit_amount: fromCents(parseDbNumericToCents(l.credit_amount)),
         is_reconciled: Boolean(l.is_reconciled),
       };
     });
@@ -404,7 +408,7 @@ export async function fetchFinancialJournalsFromSupabase(
       voucher_code: String(row.voucher_code || ''),
       transaction_date: String(row.transaction_date || ''),
       description: String(row.description || ''),
-      total_amount: Number(row.total_amount || 0),
+      total_amount: fromCents(parseDbNumericToCents(row.total_amount)),
       status: String(row.status || 'POSTED') as TransactionJournalHeader['status'],
       lines: lines,
     };

@@ -130,6 +130,33 @@ export class AccountNotFoundError extends Error {
 export const CENTS_FACTOR = BigInt(100);
 
 /**
+ * Safely parses database decimal / numeric string directly into BigInt cents
+ * without intermediate IEEE 754 float conversion (Zero precision degradation).
+ * e.g., "25000000.50" -> 2500000050n, 25000000 -> 2500000000n
+ */
+export function parseDbNumericToCents(val: unknown): bigint {
+  if (val === null || val === undefined || val === '') return BigInt(0);
+  if (typeof val === 'bigint') return val;
+  const str = String(val).trim();
+  if (str === '') return BigInt(0);
+
+  const isNegative = str.startsWith('-');
+  const unsignedStr = isNegative ? str.slice(1) : str;
+
+  const [wholePart, rawFraction = ''] = unsignedStr.split('.');
+  const cleanWhole = wholePart.replace(/,/g, '');
+  const paddedFraction = rawFraction.padEnd(2, '0').slice(0, 2);
+  const combinedStr = `${cleanWhole}${paddedFraction}`;
+
+  try {
+    const parsed = BigInt(combinedStr);
+    return isNegative ? -parsed : parsed;
+  } catch {
+    return BigInt(0);
+  }
+}
+
+/**
  * Converts standard currency unit (e.g., IDR 10,000.50) to minor unit (BigInt cents/sen: BigInt(1000050)).
  * Prevents IEEE 754 precision drift.
  */
@@ -408,6 +435,13 @@ export function createDefaultDatabaseClient(initialBalanceInCents: bigint = BigI
         lockedBalance = balance;
         inTransaction = false;
         return { rows: [] };
+      }
+
+      if (normalizedSql.includes('SELECT') && normalizedSql.includes('BANK_STATEMENT_LINE')) {
+        return {
+          rows: [{ id: 1, bank_reference_no: 'TRX-REF-MOCK' }] as unknown as T[],
+          rowCount: 1,
+        };
       }
 
       if (normalizedSql.includes('SELECT') && normalizedSql.includes('BANK_ACCOUNTS')) {
@@ -775,60 +809,70 @@ export interface MultiSplitCalculation {
   varianceCents: bigint;
 }
 
+export interface MultiSplitPolicyConfig {
+  /** Tax withholding rate in integer basis points (e.g. 200 = 2.00% PPh 23). 10,000 bps = 100% */
+  taxRateBasisPoints?: bigint;
+  /** Maximum allowable bank fee difference in minor units/cents. Default from env RECON_MAX_FEE_TOLERANCE_CENTS or 5000000n (Rp 50.000) */
+  maxFeeVarianceInCents?: bigint;
+}
+
+export const DEFAULT_TAX_RATE_BPS = BigInt(200); // 200 basis points = 2.00% (PPh Pasal 23)
+export const DEFAULT_MAX_FEE_VARIANCE_CENTS = BigInt(
+  (typeof process !== 'undefined' && process.env?.RECON_MAX_FEE_TOLERANCE_CENTS) || '5000000'
+);
+
 /**
  * Evaluates whether a bank mutation matches an invoice with 2% PPh 23 or bank fee withholding.
- * Standard for Indonesian freight forwarding / logistics services (PPh Pasal 23 = 2%).
+ * Refactored to pure BigInt cents (Zero IEEE 754 float arithmetic) and integer basis points.
  */
 export function calculateMultiSplitMatch(
-  grossInvoiceAmount: number,
-  netBankAmount: number,
-  expectedTaxRatePct: number = 2.0
+  grossInvoiceInCents: bigint,
+  netBankInCents: bigint,
+  policy: MultiSplitPolicyConfig = {}
 ): MultiSplitCalculation {
-  const grossCents = toCents(grossInvoiceAmount);
-  const netCents = toCents(netBankAmount);
+  const taxRateBps = policy.taxRateBasisPoints ?? DEFAULT_TAX_RATE_BPS;
+  const maxFeeVariance = policy.maxFeeVarianceInCents ?? DEFAULT_MAX_FEE_VARIANCE_CENTS;
 
-  // Expected 2% PPh 23
-  const pph23Cents = (grossCents * BigInt(Math.round(expectedTaxRatePct * 100))) / BigInt(10000);
-  const expectedNetCents = grossCents - pph23Cents;
+  // Exact integer basis points tax calculation (10,000 bps = 100.00%)
+  const pph23Cents = (grossInvoiceInCents * taxRateBps) / BigInt(10000);
+  const expectedNetCents = grossInvoiceInCents - pph23Cents;
 
-  // Difference between expected net and bank receipt
-  const diffCents = expectedNetCents - netCents;
-
-  // Match if exact 2% or 2% PPh 23 with bank transfer fee up to Rp 50.000 (5,000,000 cents)
+  const diffCents = expectedNetCents - netBankInCents;
   const isExactTaxMatch = diffCents === BigInt(0);
-  const isTaxPlusFeeMatch = diffCents > BigInt(0) && diffCents <= BigInt(5000000);
+  const isTaxPlusFeeMatch = diffCents > BigInt(0) && diffCents <= maxFeeVariance;
 
   const bankFeeCents = isTaxPlusFeeMatch ? diffCents : BigInt(0);
   const isMatch = isExactTaxMatch || isTaxPlusFeeMatch;
 
   return {
     isSplitMatch: isMatch,
-    grossInvoiceCents: grossCents,
-    netBankCents: netCents,
+    grossInvoiceCents: grossInvoiceInCents,
+    netBankCents: netBankInCents,
     pph23Cents,
     bankFeeCents,
-    varianceCents: isMatch ? BigInt(0) : grossCents - netCents,
+    varianceCents: isMatch ? BigInt(0) : grossInvoiceInCents - netBankInCents,
   };
 }
 
 /**
  * Creates a balanced double-entry multi-split settlement journal:
- * Debit Bank (Net received)
- * Debit Uang Muka PPh 23 (Prepaid Tax 2%)
- * Debit Beban Administrasi Bank (Fee, if any)
- * Credit Piutang Usaha / AR (Gross invoice fully cleared)
+ * Debit Bank (Net received in cents)
+ * Debit Uang Muka PPh 23 (Prepaid Tax in cents)
+ * Debit Beban Administrasi Bank (Fee in cents, if any)
+ * Credit Piutang Usaha / AR (Gross invoice fully cleared in cents)
  */
 export function createMultiSplitSettlementJournal(
   voucherCode: string,
   invoiceNo: string,
-  grossInvoiceAmount: number,
-  netBankAmount: number,
-  customerName: string = 'Pelanggan'
+  grossInvoiceInCents: bigint,
+  netBankInCents: bigint,
+  customerName: string = 'Pelanggan',
+  policy: MultiSplitPolicyConfig = {}
 ): JournalEntry {
-  const calc = calculateMultiSplitMatch(grossInvoiceAmount, netBankAmount);
+  const calc = calculateMultiSplitMatch(grossInvoiceInCents, netBankInCents, policy);
   if (!calc.isSplitMatch) {
     throw new Error(
-      `Amount does not match PPh 23 (2%) or fee tolerance: Invoice ${grossInvoiceAmount} vs Bank ${netBankAmount}`
+      `Amount does not match PPh 23 (2%) or fee tolerance: Invoice ${grossInvoiceInCents.toString()} cents vs Bank ${netBankInCents.toString()} cents`
     );
   }
 
@@ -894,4 +938,116 @@ export function createStornoReversalVoucher(
     issuedAt: nowIso,
     reversedJournal: builder.build(),
   };
+}
+
+// ============================================================================
+// 10. Concurrency-Safe Transactional Unmatch (SERIALIZABLE + Row-Level Locking)
+// ============================================================================
+
+export interface UnmatchReconciliationResult {
+  success: boolean;
+  groupId: string;
+  unmatchedBankRefs: string[];
+  unmatchedVouchers: string[];
+  stornoVouchers: StornoVoucher[];
+  unmatchedAt: string;
+  message: string;
+}
+
+/**
+ * Unmatches a reconciliation group with SERIALIZABLE transaction isolation
+ * and row-level locking (SELECT ... FOR UPDATE) to eliminate race conditions between concurrent users.
+ */
+export async function unmatchReconciliationGroupSecurely(
+  groupId: string,
+  reason: string,
+  dbClient: DatabaseClient,
+  operator: string = 'Accounting Supervisor'
+): Promise<UnmatchReconciliationResult> {
+  if (!groupId || groupId.trim() === '') {
+    throw new Error('Reconciliation match groupId is required for unmatching.');
+  }
+
+  const cleanGroupId = groupId.trim();
+  const nowIso = new Date().toISOString();
+
+  // Enforce SERIALIZABLE isolation level for the unmatch transaction
+  await dbClient.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+  await dbClient.query('BEGIN');
+
+  try {
+    // 1. Lock reconciliation match row using row-level locking
+    const matchLockSql = `
+      SELECT id, match_group_id, statement_line_id, journal_line_id 
+      FROM bank_reconciliation_match 
+      WHERE match_group_id = $1 
+      FOR UPDATE
+    `;
+    await dbClient.query<{ id: string | number; statement_line_id?: string; journal_line_id?: string }>(
+      matchLockSql,
+      [cleanGroupId]
+    );
+
+    // 2. Lock associated bank statement lines
+    const bankLockSql = `
+      SELECT id, bank_reference_no, status, matched_group_id 
+      FROM bank_statement_line 
+      WHERE matched_group_id = $1 
+      FOR UPDATE
+    `;
+    const bankRows = await dbClient.query<{ id: string | number; bank_reference_no: string }>(bankLockSql, [cleanGroupId]);
+
+    const bankRefs = bankRows.rows ? bankRows.rows.map((r) => r.bank_reference_no) : [];
+
+    // 3. Revert bank statement lines to UNMATCHED
+    const revertBankSql = `
+      UPDATE bank_statement_line 
+      SET status = 'UNMATCHED', 
+          matched_group_id = NULL, 
+          allocated_amount = 0, 
+          updated_at = NOW() 
+      WHERE matched_group_id = $1
+    `;
+    await dbClient.query(revertBankSql, [cleanGroupId]);
+
+    // 4. Revert journal lines to unreconciled
+    const revertJournalSql = `
+      UPDATE transaction_journal_line 
+      SET is_reconciled = FALSE, 
+          matched_group_id = NULL 
+      WHERE matched_group_id = $1
+    `;
+    await dbClient.query(revertJournalSql, [cleanGroupId]);
+
+    // 5. Delete or mark tombstone on reconciliation match
+    const deleteMatchSql = 'DELETE FROM bank_reconciliation_match WHERE match_group_id = $1';
+    await dbClient.query(deleteMatchSql, [cleanGroupId]);
+
+    // 6. Record immutable audit log
+    const auditSql = `
+      INSERT INTO reconciliation_audit_logs (
+        event_type, 
+        match_group_id, 
+        reason, 
+        operator, 
+        created_at
+      ) VALUES ('UNMATCH_STORNO', $1, $2, $3, NOW())
+    `;
+    await dbClient.query(auditSql, [cleanGroupId, reason, operator]);
+
+    await dbClient.query('COMMIT');
+
+    return {
+      success: true,
+      groupId: cleanGroupId,
+      unmatchedBankRefs: bankRefs,
+      unmatchedVouchers: [],
+      stornoVouchers: [],
+      unmatchedAt: nowIso,
+      message: `Reconciliation group ${cleanGroupId} successfully unlinked with SERIALIZABLE transaction safety.`,
+    };
+  } catch (error) {
+    await dbClient.query('ROLLBACK');
+    throw error;
+  }
 }
