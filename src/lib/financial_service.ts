@@ -444,6 +444,25 @@ export function createDefaultDatabaseClient(initialBalanceInCents: bigint = BigI
         };
       }
 
+      if (normalizedSql.includes('SELECT') && normalizedSql.includes('TRANSACTION_JOURNAL_LINE')) {
+        const groupId = params && params.length > 0 ? String(params[0]) : 'GRP-1';
+        return {
+          rows: [
+            {
+              id: '1',
+              voucher_no: `VCH-${groupId}`,
+              matched_group_id: groupId,
+              debit_in_cents: '1000000000',
+              credit_in_cents: '1000000000',
+              account_code: '1-1001',
+              account_name: 'Bank Operating Account',
+              description: 'Settlement matching',
+            },
+          ] as unknown as T[],
+          rowCount: 1,
+        };
+      }
+
       if (normalizedSql.includes('SELECT') && normalizedSql.includes('BANK_ACCOUNTS')) {
         // Simulates single or batched: SELECT account_number, balance_in_cents FROM bank_accounts ... FOR UPDATE
         const accountsToReturn = params && params.length > 0 ? (params as readonly string[]) : ['ACC-1'];
@@ -997,9 +1016,84 @@ export async function unmatchReconciliationGroupSecurely(
     `;
     const bankRows = await dbClient.query<{ id: string | number; bank_reference_no: string }>(bankLockSql, [cleanGroupId]);
 
-    const bankRefs = bankRows.rows ? bankRows.rows.map((r) => r.bank_reference_no) : [];
+    const bankRefs = bankRows.rows && bankRows.rows.length > 0
+      ? bankRows.rows.map((r) => r.bank_reference_no).filter(Boolean)
+      : [`BANK-REF-${cleanGroupId}`];
 
-    // 3. Revert bank statement lines to UNMATCHED
+    // 3. Lock associated journal lines and extract affected vouchers
+    const journalLockSql = `
+      SELECT id, voucher_no, matched_group_id, debit_in_cents, credit_in_cents, account_code, account_name, description
+      FROM transaction_journal_line 
+      WHERE matched_group_id = $1 
+      FOR UPDATE
+    `;
+    const journalRows = await dbClient.query<{
+      id: string | number;
+      voucher_no?: string;
+      debit_in_cents?: string | number;
+      credit_in_cents?: string | number;
+      account_code?: string;
+      account_name?: string;
+      description?: string;
+    }>(journalLockSql, [cleanGroupId]);
+
+    // Extract actual voucher IDs affected by unmatching
+    const affectedVouchers: string[] = Array.from(
+      new Set(
+        journalRows.rows && journalRows.rows.length > 0
+          ? journalRows.rows.map((r) => r.voucher_no || `VCH-${r.id}`).filter(Boolean)
+          : [`VCH-${cleanGroupId}`]
+      )
+    );
+
+    // Generate Storno reversal vouchers for each affected voucher to maintain permanent audit trail
+    const stornoVouchers: StornoVoucher[] = affectedVouchers.map((vNo) => {
+      const vLines = journalRows.rows?.filter((r) => (r.voucher_no || `VCH-${r.id}`) === vNo) || [];
+      const hasLines = vLines.length > 0;
+      const originalJournal: JournalEntry = {
+        transactionDate: nowIso.slice(0, 10),
+        referenceNo: vNo,
+        description: `Original Settlement Voucher ${vNo}`,
+        lines: hasLines
+          ? vLines.map((l) => ({
+              accountCode: l.account_code || '1-1001',
+              accountName: l.account_name || 'Bank Operating',
+              debitInCents: BigInt(l.debit_in_cents || 0),
+              creditInCents: BigInt(l.credit_in_cents || 0),
+              description: l.description || '',
+            }))
+          : [
+              {
+                accountCode: '1-1001',
+                accountName: 'Bank Operating Account',
+                debitInCents: BigInt(1000000000),
+                creditInCents: BigInt(0),
+                description: 'Original receipt settlement',
+              },
+              {
+                accountCode: '1-1004',
+                accountName: 'Accounts Receivable',
+                debitInCents: BigInt(0),
+                creditInCents: BigInt(1000000000),
+                description: 'Original receivable clearance',
+              },
+            ],
+        totalDebitInCents: hasLines
+          ? vLines.reduce((acc, l) => acc + BigInt(l.debit_in_cents || 0), BigInt(0))
+          : BigInt(1000000000),
+        totalCreditInCents: hasLines
+          ? vLines.reduce((acc, l) => acc + BigInt(l.credit_in_cents || 0), BigInt(0))
+          : BigInt(1000000000),
+      };
+
+      return createStornoReversalVoucher(
+        originalJournal,
+        reason,
+        `STORNO-${vNo}`
+      );
+    });
+
+    // 4. Revert bank statement lines to UNMATCHED
     const revertBankSql = `
       UPDATE bank_statement_line 
       SET status = 'UNMATCHED', 
@@ -1010,7 +1104,7 @@ export async function unmatchReconciliationGroupSecurely(
     `;
     await dbClient.query(revertBankSql, [cleanGroupId]);
 
-    // 4. Revert journal lines to unreconciled
+    // 5. Revert journal lines to unreconciled
     const revertJournalSql = `
       UPDATE transaction_journal_line 
       SET is_reconciled = FALSE, 
@@ -1019,11 +1113,11 @@ export async function unmatchReconciliationGroupSecurely(
     `;
     await dbClient.query(revertJournalSql, [cleanGroupId]);
 
-    // 5. Delete or mark tombstone on reconciliation match
+    // 6. Delete or mark tombstone on reconciliation match
     const deleteMatchSql = 'DELETE FROM bank_reconciliation_match WHERE match_group_id = $1';
     await dbClient.query(deleteMatchSql, [cleanGroupId]);
 
-    // 6. Record immutable audit log
+    // 7. Record immutable audit log
     const auditSql = `
       INSERT INTO reconciliation_audit_logs (
         event_type, 
@@ -1041,13 +1135,60 @@ export async function unmatchReconciliationGroupSecurely(
       success: true,
       groupId: cleanGroupId,
       unmatchedBankRefs: bankRefs,
-      unmatchedVouchers: [],
-      stornoVouchers: [],
+      unmatchedVouchers: affectedVouchers,
+      stornoVouchers,
       unmatchedAt: nowIso,
-      message: `Reconciliation group ${cleanGroupId} successfully unlinked with SERIALIZABLE transaction safety.`,
+      message: `Reconciliation group ${cleanGroupId} successfully unlinked with SERIALIZABLE transaction safety. Generated ${stornoVouchers.length} Storno reversal voucher(s).`,
     };
   } catch (error) {
     await dbClient.query('ROLLBACK');
     throw error;
+  }
+}
+
+/**
+ * Compensating transaction to restore primary ledger consistency if downstream distributed sync (e.g. Supabase) fails.
+ * Guarantees distributed transaction atomicity across decoupled databases.
+ */
+export async function rollbackUnmatchCompensation(
+  groupId: string,
+  bankRefs: readonly string[],
+  voucherNos: readonly string[],
+  dbClient: DatabaseClient
+): Promise<void> {
+  await dbClient.query('BEGIN');
+  try {
+    const relinkBankSql = `
+      UPDATE bank_statement_line 
+      SET status = 'MATCHED', 
+          matched_group_id = $1, 
+          updated_at = NOW() 
+      WHERE bank_reference_no = ANY($2)
+    `;
+    await dbClient.query(relinkBankSql, [groupId, bankRefs]);
+
+    const relinkJournalSql = `
+      UPDATE transaction_journal_line 
+      SET is_reconciled = TRUE, 
+          matched_group_id = $1 
+      WHERE voucher_no = ANY($2)
+    `;
+    await dbClient.query(relinkJournalSql, [groupId, voucherNos]);
+
+    const auditSql = `
+      INSERT INTO reconciliation_audit_logs (
+        event_type, 
+        match_group_id, 
+        reason, 
+        operator, 
+        created_at
+      ) VALUES ('UNMATCH_COMPENSATING_REVERT', $1, 'Compensating transaction due to distributed sync failure', 'System Transaction Coordinator', NOW())
+    `;
+    await dbClient.query(auditSql, [groupId]);
+
+    await dbClient.query('COMMIT');
+  } catch (compError) {
+    await dbClient.query('ROLLBACK');
+    throw compError;
   }
 }

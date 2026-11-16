@@ -38,8 +38,8 @@ def get_clean_diff():
         print(f"ℹ️ Git diff command note: {e}")
         diff = ""
 
-    # Truncate context to ~40KB safe limit to prevent context exhaustion
-    return diff[:40000]
+    # Allow up to 250KB clean diff (well within Gemini context window) to evaluate complete multi-file changes
+    return diff[:250000]
 
 # 3. Analyze Diff with Google Gemini API (Structured JSON Output)
 def analyze_diff_with_gemini(diff_text):
