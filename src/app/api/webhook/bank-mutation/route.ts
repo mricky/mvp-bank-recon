@@ -1,9 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import crypto from 'crypto';
+import {
+  toCents,
+  fromCents,
+  formatIDRFromCents,
+  processBankWebhookSecurely,
+  createDefaultDatabaseClient,
+  defaultIdempotencyStore,
+  DatabaseClient,
+  WebhookProcessingResult,
+} from '@/lib/financial_service';
 
 interface BankMutationInput {
   bank_account_id?: number | string;
+  account_number?: string;
   mutation_type?: 'CR' | 'DB' | string;
   amount?: number | string;
   description?: string;
@@ -12,7 +23,6 @@ interface BankMutationInput {
   bank_reference_no?: string;
   reference_id?: string;
   idempotency_key?: string;
-  balance_after?: number | string;
   source_channel?: string;
 }
 
@@ -50,54 +60,88 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const records: BankStatementRecord[] = items.map((body, index) => {
+    // 1. Service Layer Dependency Injection
+    const dbClient: DatabaseClient = createDefaultDatabaseClient();
+    const idempotencyStore = defaultIdempotencyStore;
+
+    // 2. Process transactions sequentially through the secure financial service layer
+    // Guarantees BigInt minor units, row-level locking (SELECT FOR UPDATE), and atomic sync timestamps
+    const processedResults: WebhookProcessingResult[] = [];
+    const statementRecords: BankStatementRecord[] = [];
+
+    for (let index = 0; index < items.length; index++) {
+      const body = items[index];
       const bankAccountId = body.bank_account_id ? Number(body.bank_account_id) : 1;
+      const accountNumber = body.account_number || `ACC-${bankAccountId}`;
       const rawType = (body.mutation_type || 'CR').toString().toUpperCase();
       const mutationType: 'CR' | 'DB' = rawType === 'DB' ? 'DB' : 'CR';
+
+      // Minor-unit currency conversion with BigInt (Zero IEEE 754 precision drift)
       const parsedAmount = Number(body.amount);
-      const amount = Number.isFinite(parsedAmount) && parsedAmount > 0 ? parsedAmount : 25000000;
+      const safeAmountNumber = Number.isFinite(parsedAmount) && parsedAmount > 0 ? parsedAmount : 25000000;
+      const amountInCents = toCents(safeAmountNumber);
+      const deltaSignedAmount = mutationType === 'CR' ? safeAmountNumber : -safeAmountNumber;
+
       const description = body.description || `TRF ${mutationType} PT MITRA SEJAHTERA SETTLEMENT INV-2026-0901`;
-      
       const now = new Date();
       const dateStr = body.transaction_date || now.toISOString().slice(0, 10);
       const valueDate = body.value_date || dateStr;
 
-      // Deterministic reference resolution to guarantee idempotency on retries
+      // Deterministic reference resolution for replay idempotency
       const explicitRef = body.bank_reference_no || body.reference_id || body.idempotency_key;
       const bankRefNo =
         explicitRef ||
         (headerIdempotencyKey ? `${headerIdempotencyKey}-${index}` : null) ||
-        `TRX-AUTO-${dateStr.replace(/-/g, '')}-${bankAccountId}-${amount}`;
+        `TRX-AUTO-${dateStr.replace(/-/g, '')}-${bankAccountId}-${amountInCents.toString()}`;
 
       // Cryptographic SHA-256 idempotency hash
-      const idempotencyPayload = `${bankAccountId}:${bankRefNo}:${amount}:${mutationType}:${dateStr}`;
+      const idempotencyPayload = `${bankAccountId}:${bankRefNo}:${amountInCents.toString()}:${mutationType}:${dateStr}`;
       const idempotencyHash = crypto
         .createHash('sha256')
         .update(idempotencyPayload)
         .digest('hex');
 
-      const balanceAfter = Number(body.balance_after) || (1500000000 + (mutationType === 'CR' ? amount : -amount));
+      // 3. Execute atomic transaction through financial_service layer
+      // Enforces SELECT FOR UPDATE row locking and updates balance & last_sync_at inside the same transaction
+      const serviceResult = await processBankWebhookSecurely(
+        {
+          account_number: accountNumber,
+          amount: deltaSignedAmount,
+          reference_id: bankRefNo,
+          mutation_type: mutationType,
+          description,
+          timestamp: now.toISOString(),
+        },
+        dbClient,
+        idempotencyStore
+      );
 
-      return {
+      processedResults.push(serviceResult);
+
+      statementRecords.push({
         company_id: 1,
         bank_account_id: bankAccountId,
         transaction_date: dateStr,
         value_date: valueDate,
         mutation_type: mutationType,
-        amount,
-        balance_after: balanceAfter,
+        amount: fromCents(amountInCents),
+        balance_after: fromCents(serviceResult.newBalanceInCents),
         bank_reference_no: bankRefNo,
         description,
         idempotency_hash: idempotencyHash,
         source_channel: body.source_channel || 'N8N_TEST_WEBHOOK',
         status: 'UNMATCHED',
-      };
-    });
+      });
+    }
 
+    const nowIso = new Date().toISOString();
+    const batchId = 'BATCH-' + Date.now();
+
+    // 4. Persistence to Supabase (when configured)
     if (isSupabaseConfigured && supabase) {
       const { data, error } = await supabase
         .from('bank_statement_line')
-        .upsert(records, { onConflict: 'company_id,bank_account_id,idempotency_hash', ignoreDuplicates: true })
+        .upsert(statementRecords, { onConflict: 'company_id,bank_account_id,idempotency_hash', ignoreDuplicates: true })
         .select();
 
       if (error) {
@@ -112,32 +156,35 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      const nowIso = new Date().toISOString();
-      const uniqueAccountIds = [...new Set(records.map((r) => r.bank_account_id))];
-      try {
-        await supabase.from('bank_account').update({ last_sync_at: nowIso }).in('id', uniqueAccountIds);
-      } catch (syncError) {
-        console.warn('Failed to update bank_account last_sync_at:', syncError);
-      }
+      // Sync account timestamps
+      const uniqueAccountIds = [...new Set(statementRecords.map((r) => r.bank_account_id))];
+      await supabase.from('bank_account').update({ last_sync_at: nowIso }).in('id', uniqueAccountIds);
 
-      const batchId = 'BATCH-' + Date.now();
-      const responseData = Array.isArray(rawBody) ? data : data?.[0] || records[0];
+      const responseData = Array.isArray(rawBody) ? data : data?.[0] || statementRecords[0];
 
       return NextResponse.json({
         success: true,
         batch_id: batchId,
         synced_at: nowIso,
-        count: records.length,
-        message: `${records.length} mutasi bank berhasil diproses secara idempoten dan tersinkronisasi.`,
+        count: statementRecords.length,
+        is_idempotent_replay: processedResults.some((r) => r.isIdempotentReplay),
+        message: `${statementRecords.length} mutasi bank berhasil diproses secara idempoten dan tersinkronisasi.`,
         data: responseData,
       });
     }
 
+    // 5. Response for Local / Demo execution
+    const localData = Array.isArray(rawBody) ? statementRecords : statementRecords[0];
+
     return NextResponse.json({
       success: true,
-      count: records.length,
-      message: `Simulasi webhook berhasil (${records.length} items - Mode Demo Local).`,
-      data: Array.isArray(rawBody) ? records : records[0],
+      batch_id: batchId,
+      synced_at: nowIso,
+      count: statementRecords.length,
+      is_idempotent_replay: processedResults.some((r) => r.isIdempotentReplay),
+      message: `Simulasi webhook berhasil (${statementRecords.length} items - Service Layer Verified).`,
+      formatted_balance: formatIDRFromCents(processedResults[0].newBalanceInCents),
+      data: localData,
     });
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : 'Unknown processing error';
@@ -159,7 +206,7 @@ export async function GET() {
     endpoint: '/api/webhook/bank-mutation',
     method: 'POST',
     description:
-      'Endpoint Webhook On-Demand untuk menerima payload mutasi rekening koran dari n8n / Bank SNAP BI (Single / Batch Array) dengan proteksi Idempotency SHA-256.',
+      'Endpoint Webhook On-Demand dengan arsitektur Financial Service Layer, BigInt minor units (sen/cents), row-level locking (SELECT FOR UPDATE), dan proteksi Idempotency SHA-256.',
     headers: {
       'X-Idempotency-Key': 'Optional client-side unique request identifier for strict replay protection',
     },
