@@ -8,6 +8,10 @@ import {
   ReconciliationSession,
 } from '@/types/reconciliation';
 import {
+  calculateMultiSplitMatch,
+  fromCents,
+} from '@/lib/financial_service';
+import {
   INITIAL_SESSION,
   INITIAL_JOURNAL_LINES,
   INITIAL_RULES,
@@ -701,7 +705,7 @@ export default function BankReconciliationPage() {
     // PASS 1: Auto-Adjustment Rules (Biaya Adm & Pendapatan Bunga)
     // -------------------------------------------------------------
     currentBankLines = currentBankLines.map((bank) => {
-      if (bank.status === 'MATCHED' || isSplitTargetBank(bank)) return bank;
+      if (bank.status === 'MATCHED' || isSplitTargetBank(bank) || bank.compliance_flag === 'FLAG_CLOSED_PERIOD') return bank;
 
       const rule = INITIAL_RULES.find(
         (r) =>
@@ -747,7 +751,7 @@ export default function BankReconciliationPage() {
     // PASS 2: Reference Pattern (Invoice/Voucher) & Date Window (H+3)
     // -------------------------------------------------------------
     currentBankLines = currentBankLines.map((bank) => {
-      if (bank.status === 'MATCHED' || isSplitTargetBank(bank)) return bank;
+      if (bank.status === 'MATCHED' || isSplitTargetBank(bank) || bank.compliance_flag === 'FLAG_CLOSED_PERIOD') return bank;
 
       const bankInvoice = extractInvoiceNo(bank.description);
 
@@ -796,7 +800,7 @@ export default function BankReconciliationPage() {
     // PASS 3: Exact 1-to-1 Match (Same Nominal & Transaction Flow)
     // -------------------------------------------------------------
     currentBankLines = currentBankLines.map((bank) => {
-      if (bank.status === 'MATCHED' || isSplitTargetBank(bank)) return bank;
+      if (bank.status === 'MATCHED' || isSplitTargetBank(bank) || bank.compliance_flag === 'FLAG_CLOSED_PERIOD') return bank;
 
       const foundIdx = currentJournalLines.findIndex(
         (j) =>
@@ -821,6 +825,65 @@ export default function BankReconciliationPage() {
           voucherCode: currentJournalLines[foundIdx].voucher_code,
           amount: bank.amount,
           matchType: 'EXACT_1_TO_1',
+        });
+
+        return {
+          ...bank,
+          status: 'MATCHED' as const,
+          matched_group_id: groupId,
+        };
+      }
+
+      return bank;
+    });
+
+    // -------------------------------------------------------------
+    // PASS 3.5: Multi-Split PPh 23 (2% Withholding Tax) & Bank Fee Matching
+    // -------------------------------------------------------------
+    currentBankLines = currentBankLines.map((bank) => {
+      if (bank.status === 'MATCHED' || isSplitTargetBank(bank) || bank.compliance_flag === 'FLAG_CLOSED_PERIOD') return bank;
+
+      const foundIdx = currentJournalLines.findIndex((j) => {
+        if (j.is_reconciled || isSplitTargetJournal(j)) return false;
+        if (j.type !== bank.mutation_type) return false;
+
+        const calc = calculateMultiSplitMatch(j.amount, bank.amount);
+        return calc.isSplitMatch;
+      });
+
+      if (foundIdx !== -1) {
+        matchCount++;
+        const targetJ = currentJournalLines[foundIdx];
+        const groupId = generateUUID();
+        const calc = calculateMultiSplitMatch(targetJ.amount, bank.amount);
+
+        currentJournalLines[foundIdx] = {
+          ...targetJ,
+          is_reconciled: true,
+          matched_group_id: groupId,
+        };
+
+        // Create Tax adjustment journal for PPh 23
+        const taxAdjJournal: JournalLine = {
+          id: `JL-TAX-${bank.id}`,
+          voucher_code: `BKK-PPH23-${bank.id.substring(3)}`,
+          transaction_date: bank.transaction_date,
+          account_code: '1-1008',
+          account_name: 'Uang Muka PPh Pasal 23 (Prepaid Tax 2%)',
+          description: `Bukti Potong PPh 23 (2%) atas tagihan ${targetJ.voucher_code}`,
+          type: 'CR',
+          amount: fromCents(calc.pph23Cents),
+          is_reconciled: true,
+          matched_group_id: groupId,
+        };
+        newJournals.push(taxAdjJournal);
+
+        matchSyncPairs.push({
+          groupId,
+          bankRef: bank.bank_reference_no,
+          voucherCode: targetJ.voucher_code,
+          amount: bank.amount,
+          matchType: 'MULTI_SPLIT_PPH23',
         });
 
         return {
@@ -1272,12 +1335,24 @@ export default function BankReconciliationPage() {
   };
 
   const handleUnmatch = (groupId: string) => {
+    const targetJournals = journalLines.filter((j) => j.matched_group_id === groupId);
     const unmatchBankRefs = bankLines
       .filter((b) => b.matched_group_id === groupId)
       .map((b) => b.bank_reference_no);
-    const unmatchVouchers = journalLines
-      .filter((j) => j.matched_group_id === groupId)
-      .map((j) => j.voucher_code);
+    const unmatchVouchers = targetJournals.map((j) => j.voucher_code);
+
+    // PSAK 1 Audit Trail Immutability: Penerbitan Jurnal Pembalik (Storno Voucher)
+    const stornoJournals: JournalLine[] = targetJournals.map((origJ) => ({
+      id: `STORNO-${origJ.id}-${Date.now().toString().slice(-4)}`,
+      voucher_code: `STORNO-${origJ.voucher_code}`,
+      transaction_date: new Date().toISOString().slice(0, 10),
+      account_code: origJ.account_code,
+      account_name: origJ.account_name,
+      description: `[STORNO PEMBALIK] Pembatalan Rekonsiliasi ${origJ.voucher_code} (Audit Trail Terjaga)`,
+      type: origJ.type === 'CR' ? 'DB' : 'CR',
+      amount: origJ.amount,
+      is_reconciled: false,
+    }));
 
     setBankLines((prev) =>
       prev.map((b) =>
@@ -1292,16 +1367,17 @@ export default function BankReconciliationPage() {
           : b
       )
     );
-    setJournalLines((prev) =>
-      prev.map((j) =>
+    setJournalLines((prev) => [
+      ...prev.map((j) =>
         j.matched_group_id === groupId
           ? { ...j, is_reconciled: false, matched_group_id: undefined }
           : j
-      )
-    );
+      ),
+      ...stornoJournals,
+    ]);
 
     setBannerMessage(
-      `Berhasil me-rollback rekonsiliasi. Transaksi kembali ke status Belum Cocok / Belum Kliring.`
+      `Berhasil membatalkan rekonsiliasi. Jurnal Pembalik (Storno Voucher) telah diterbitkan dan transaksi bank kembali ke status Belum Cocok (Audit Trail terjaga).`
     );
     setTimeout(() => setBannerMessage(null), 4500);
 
@@ -3062,9 +3138,19 @@ export default function BankReconciliationPage() {
                                     </button>
                                   </div>
                                 ) : (
-                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
-                                    UNMATCHED
-                                  </span>
+                                  <div className="flex flex-col items-center gap-1">
+                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
+                                      UNMATCHED
+                                    </span>
+                                    {bank.compliance_flag === 'FLAG_CLOSED_PERIOD' && (
+                                      <span
+                                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-100 text-rose-800 border border-rose-300"
+                                        title="Periode fiskal telah ditutup (CLOSED). Mutasi ini tidak dapat dicocokkan ke periode lampau tanpa jurnal penyesuaian."
+                                      >
+                                        <Lock className="w-2.5 h-2.5 text-rose-600" /> TUTUP BUKU
+                                      </span>
+                                    )}
+                                  </div>
                                 )}
                               </td>
                             </tr>

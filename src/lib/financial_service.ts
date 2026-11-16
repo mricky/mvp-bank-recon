@@ -719,3 +719,179 @@ export async function processBankWebhookBatchSecurely(
     throw error;
   }
 }
+
+// ============================================================================
+// 7. Fiscal Period Governance (Tutup Buku / Closed Period Compliance)
+// ============================================================================
+
+export interface FiscalPeriodConfig {
+  periodName: string;
+  startDate: string;
+  endDate: string;
+  status: 'OPEN' | 'CLOSED';
+}
+
+export const DEFAULT_FISCAL_PERIODS: FiscalPeriodConfig[] = [
+  { periodName: 'Januari 2026', startDate: '2026-01-01', endDate: '2026-01-31', status: 'CLOSED' },
+  { periodName: 'Februari 2026', startDate: '2026-02-01', endDate: '2026-02-28', status: 'CLOSED' },
+  { periodName: 'Maret 2026', startDate: '2026-03-01', endDate: '2026-03-31', status: 'CLOSED' },
+  { periodName: 'April 2026', startDate: '2026-04-01', endDate: '2026-04-30', status: 'CLOSED' },
+  { periodName: 'Mei 2026', startDate: '2026-05-01', endDate: '2026-05-31', status: 'CLOSED' },
+  { periodName: 'Juni 2026', startDate: '2026-06-01', endDate: '2026-06-30', status: 'CLOSED' },
+  { periodName: 'Juli 2026', startDate: '2026-07-01', endDate: '2026-07-31', status: 'CLOSED' },
+  { periodName: 'Agustus 2026', startDate: '2026-08-01', endDate: '2026-08-31', status: 'CLOSED' },
+  { periodName: 'September 2026', startDate: '2026-09-01', endDate: '2026-09-30', status: 'OPEN' },
+  { periodName: 'Oktober 2026', startDate: '2026-10-01', endDate: '2026-10-31', status: 'OPEN' },
+];
+
+/**
+ * Validates whether a transaction date falls into a closed fiscal period.
+ * Under PSAK / SAK EP, transactions in closed periods cannot be modified or posted to past ledgers.
+ */
+export function isFiscalPeriodClosed(
+  transactionDate: string,
+  periods: readonly FiscalPeriodConfig[] = DEFAULT_FISCAL_PERIODS
+): boolean {
+  const targetDate = transactionDate.slice(0, 10);
+  for (const p of periods) {
+    if (targetDate >= p.startDate && targetDate <= p.endDate) {
+      return p.status === 'CLOSED';
+    }
+  }
+  // Dates before September 2026 are considered closed by default
+  return targetDate < '2026-09-01';
+}
+
+// ============================================================================
+// 8. Multi-Split Matching Engine (PPh 23 Tax Withholding & Bank Fee Split)
+// ============================================================================
+
+export interface MultiSplitCalculation {
+  isSplitMatch: boolean;
+  grossInvoiceCents: bigint;
+  netBankCents: bigint;
+  pph23Cents: bigint;
+  bankFeeCents: bigint;
+  varianceCents: bigint;
+}
+
+/**
+ * Evaluates whether a bank mutation matches an invoice with 2% PPh 23 or bank fee withholding.
+ * Standard for Indonesian freight forwarding / logistics services (PPh Pasal 23 = 2%).
+ */
+export function calculateMultiSplitMatch(
+  grossInvoiceAmount: number,
+  netBankAmount: number,
+  expectedTaxRatePct: number = 2.0
+): MultiSplitCalculation {
+  const grossCents = toCents(grossInvoiceAmount);
+  const netCents = toCents(netBankAmount);
+
+  // Expected 2% PPh 23
+  const pph23Cents = (grossCents * BigInt(Math.round(expectedTaxRatePct * 100))) / BigInt(10000);
+  const expectedNetCents = grossCents - pph23Cents;
+
+  // Difference between expected net and bank receipt
+  const diffCents = expectedNetCents - netCents;
+
+  // Match if exact 2% or 2% PPh 23 with bank transfer fee up to Rp 50.000 (5,000,000 cents)
+  const isExactTaxMatch = diffCents === BigInt(0);
+  const isTaxPlusFeeMatch = diffCents > BigInt(0) && diffCents <= BigInt(5000000);
+
+  const bankFeeCents = isTaxPlusFeeMatch ? diffCents : BigInt(0);
+  const isMatch = isExactTaxMatch || isTaxPlusFeeMatch;
+
+  return {
+    isSplitMatch: isMatch,
+    grossInvoiceCents: grossCents,
+    netBankCents: netCents,
+    pph23Cents,
+    bankFeeCents,
+    varianceCents: isMatch ? BigInt(0) : grossCents - netCents,
+  };
+}
+
+/**
+ * Creates a balanced double-entry multi-split settlement journal:
+ * Debit Bank (Net received)
+ * Debit Uang Muka PPh 23 (Prepaid Tax 2%)
+ * Debit Beban Administrasi Bank (Fee, if any)
+ * Credit Piutang Usaha / AR (Gross invoice fully cleared)
+ */
+export function createMultiSplitSettlementJournal(
+  voucherCode: string,
+  invoiceNo: string,
+  grossInvoiceAmount: number,
+  netBankAmount: number,
+  customerName: string = 'Pelanggan'
+): JournalEntry {
+  const calc = calculateMultiSplitMatch(grossInvoiceAmount, netBankAmount);
+  if (!calc.isSplitMatch) {
+    throw new Error(
+      `Amount does not match PPh 23 (2%) or fee tolerance: Invoice ${grossInvoiceAmount} vs Bank ${netBankAmount}`
+    );
+  }
+
+  const builder = new JournalBuilder(
+    voucherCode,
+    `Pelunasan Invoice ${invoiceNo} - ${customerName} (Multi-Split PPh 23 Net Settlement)`
+  )
+    .addDebit('1-1001', 'Kas / Bank BCA', calc.netBankCents, 'Penerimaan bersih masuk rekening bank')
+    .addDebit('1-1008', 'Uang Muka PPh 23', calc.pph23Cents, `Bukti Potong PPh 23 (2%) Invoice ${invoiceNo}`);
+
+  if (calc.bankFeeCents > BigInt(0)) {
+    builder.addDebit('5-1001', 'Beban Administrasi Bank', calc.bankFeeCents, 'Biaya administrasi / kliring bank');
+  }
+
+  builder.addCredit('1-1004', 'Piutang Usaha (AR)', calc.grossInvoiceCents, `Pelunasan penuh tagihan Invoice ${invoiceNo}`);
+
+  return builder.build();
+}
+
+// ============================================================================
+// 9. Storno / Reversal Voucher Engine (Audit Trail Immutability)
+// ============================================================================
+
+export interface StornoVoucher {
+  stornoVoucherCode: string;
+  originalVoucherCode: string;
+  reason: string;
+  issuedAt: string;
+  reversedJournal: JournalEntry;
+}
+
+/**
+ * Generates an accounting Storno (Reversal Voucher) to preserve audit immutability (PSAK 1).
+ * Reverses the debits and credits of the original journal without deleting records.
+ */
+export function createStornoReversalVoucher(
+  originalJournal: JournalEntry,
+  reason: string,
+  operator: string = 'Accounting Supervisor'
+): StornoVoucher {
+  const stornoCode = `STORNO-${originalJournal.referenceNo}`;
+  const nowIso = new Date().toISOString();
+
+  const builder = new JournalBuilder(
+    stornoCode,
+    `[JURNAL PEMBALIK / STORNO] Pembatalan ${originalJournal.referenceNo}. Alasan: ${reason} (Oleh: ${operator})`
+  );
+
+  // Invert each line: original debits become credits, original credits become debits
+  for (const line of originalJournal.lines) {
+    if (line.debitInCents > BigInt(0)) {
+      builder.addCredit(line.accountCode, line.accountName, line.debitInCents, `Pembalik Debit: ${line.description || ''}`);
+    }
+    if (line.creditInCents > BigInt(0)) {
+      builder.addDebit(line.accountCode, line.accountName, line.creditInCents, `Pembalik Kredit: ${line.description || ''}`);
+    }
+  }
+
+  return {
+    stornoVoucherCode: stornoCode,
+    originalVoucherCode: originalJournal.referenceNo,
+    reason,
+    issuedAt: nowIso,
+    reversedJournal: builder.build(),
+  };
+}

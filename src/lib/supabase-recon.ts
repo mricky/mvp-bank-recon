@@ -1,5 +1,7 @@
 import { supabase, isSupabaseConfigured } from './supabase';
+import { isFiscalPeriodClosed } from './financial_service';
 import {
+  AccountSubCategory,
   BankStatementLine,
   JournalLine,
   MasterBbs,
@@ -79,31 +81,35 @@ export async function fetchBankStatementLinesFromSupabase(): Promise<BankStateme
     }
   }
 
-  return data.map((row: any) => {
-    const bankAccount = Array.isArray(row.bank_account) ? row.bank_account[0] : row.bank_account;
+  return data.map((row: Record<string, unknown>) => {
+    const rawBankAcc = row.bank_account;
+    const bankAccount = Array.isArray(rawBankAcc) ? (rawBankAcc[0] as Record<string, string>) : (rawBankAcc as Record<string, string>);
     const sId = Number(row.id);
     const matchGroupId = matchMap.get(sId);
     const allocated = matchSumMap.get(sId) || 0;
     const totalAmt = Number(row.amount);
     const remaining = Math.max(0, totalAmt - allocated);
+    const txDate = String(row.transaction_date || '');
 
     return {
       id: `BS-${String(row.id).padStart(3, '0')}`,
-      transaction_date: row.transaction_date,
-      value_date: row.value_date,
-      mutation_type: row.mutation_type,
+      transaction_date: txDate,
+      value_date: String(row.value_date || txDate),
+      mutation_type: (String(row.mutation_type || 'CR').toUpperCase() === 'DB' ? 'DB' : 'CR') as BankStatementLine['mutation_type'],
       amount: totalAmt,
       remaining_amount: row.status === 'PARTIALLY_MATCHED' ? remaining : (row.status === 'MATCHED' ? 0 : totalAmt),
       allocated_amount: allocated,
       balance_after: Number(row.balance_after || 0),
-      bank_reference_no: row.bank_reference_no,
-      description: row.description,
-      status: row.status,
+      bank_reference_no: String(row.bank_reference_no || ''),
+      description: String(row.description || ''),
+      status: String(row.status || 'UNMATCHED') as BankStatementLine['status'],
       bank_code: bankAccount?.bank_code || 'MANDIRI',
       bank_name: bankAccount?.bank_name || 'Bank Mandiri',
       account_number: bankAccount?.account_number || '142-00-1111111-1',
-      period_name: getPeriodNameFromDate(row.transaction_date),
+      period_name: getPeriodNameFromDate(txDate),
       matched_group_id: matchGroupId,
+      compliance_flag: isFiscalPeriodClosed(txDate) ? 'FLAG_CLOSED_PERIOD' : 'NORMAL',
+      is_closed_period: isFiscalPeriodClosed(txDate),
     };
   });
 }
@@ -162,43 +168,44 @@ export async function fetchJournalLinesFromSupabase(): Promise<JournalLine[]> {
 
   const result: JournalLine[] = [];
 
-  for (const row of data) {
-    const lines = row.transaction_journal_line || [];
+  for (const row of (data as Array<Record<string, unknown>>)) {
+    const lines = (row.transaction_journal_line || []) as Array<Record<string, unknown>>;
     // Line 1 is the bank line
-    const bankLine = lines.find((l: any) => l.line_no === 1) || lines[0];
+    const bankLine = lines.find((l) => l.line_no === 1) || lines[0];
 
-    const masterBbs = Array.isArray(bankLine?.master_bbs)
-      ? bankLine.master_bbs[0]
-      : bankLine?.master_bbs;
+    const rawMasterBbs = bankLine?.master_bbs;
+    const masterBbs = (Array.isArray(rawMasterBbs) ? rawMasterBbs[0] : rawMasterBbs) as Record<string, string> | undefined;
 
     const isDebit = Number(bankLine?.debit_amount || 0) > 0;
     const isReconciled = Boolean(bankLine?.is_reconciled);
 
-    const mappedLines = lines.map((l: any) => {
-      const mbbs = Array.isArray(l.master_bbs) ? l.master_bbs[0] : l.master_bbs;
+    const mappedLines = lines.map((l) => {
+      const rawMbbs = l.master_bbs;
+      const mbbs = (Array.isArray(rawMbbs) ? rawMbbs[0] : rawMbbs) as Record<string, string> | undefined;
       return {
-        id: l.id,
-        line_no: l.line_no,
+        id: Number(l.id),
+        line_no: Number(l.line_no),
         account_code: mbbs?.kd_bbs || (l.line_no === 1 ? (masterBbs?.kd_bbs || '111-201') : '112-100'),
-        account_name: mbbs?.nama_bbs || l.line_description || 'Akun GL',
-        line_description: l.line_description || row.description,
+        account_name: mbbs?.nama_bbs || (typeof l.line_description === 'string' ? l.line_description : 'Akun GL'),
+        line_description: String(l.line_description || row.description || ''),
         debit_amount: Number(l.debit_amount || 0),
         credit_amount: Number(l.credit_amount || 0),
         is_reconciled: Boolean(l.is_reconciled),
       };
     });
 
+    const txDate = String(row.transaction_date || '');
     result.push({
       id: `JL-${String(row.id).padStart(3, '0')}`,
-      voucher_code: row.voucher_code,
-      transaction_date: row.transaction_date,
+      voucher_code: String(row.voucher_code || ''),
+      transaction_date: txDate,
       account_code: masterBbs?.kd_bbs || '111-201',
-      account_name: bankLine?.line_description || masterBbs?.nama_bbs || 'Bank Mandiri Giro Operasional',
-      description: row.description,
+      account_name: typeof bankLine?.line_description === 'string' ? bankLine.line_description : (masterBbs?.nama_bbs || 'Bank Mandiri Giro Operasional'),
+      description: String(row.description || ''),
       type: isDebit ? 'CR' : 'DB',
       amount: Number(row.total_amount),
       is_reconciled: isReconciled,
-      period_name: getPeriodNameFromDate(row.transaction_date),
+      period_name: getPeriodNameFromDate(txDate),
       lines: mappedLines,
       matched_group_id: matchMap.get(Number(row.id)),
     });
@@ -227,7 +234,7 @@ export async function fetchMasterBbsFromSupabase(): Promise<MasterBbs[]> {
   }
 
   // Map subcategories based on account code standard
-  const subcategoryMap: Record<string, any> = {
+  const subcategoryMap: Record<string, AccountSubCategory> = {
     '111-': 'CURRENT_ASSET',
     '112-': 'CURRENT_ASSET',
     '121-190': 'CONTRA_ASSET',
@@ -249,7 +256,7 @@ export async function fetchMasterBbsFromSupabase(): Promise<MasterBbs[]> {
     '810-': 'OTHER_EXPENSE',
   };
 
-  const getSubcategory = (code: string) => {
+  const getSubcategory = (code: string): AccountSubCategory | undefined => {
     for (const prefix of Object.keys(subcategoryMap)) {
       if (code.startsWith(prefix) || code === prefix) {
         return subcategoryMap[prefix];
@@ -258,13 +265,13 @@ export async function fetchMasterBbsFromSupabase(): Promise<MasterBbs[]> {
     return undefined;
   };
 
-  const supabaseAccounts: MasterBbs[] = data.map((row: any) => ({
-    id: row.id,
-    kd_bbs: row.kd_bbs,
-    nama_bbs: row.nama_bbs,
-    account_type: row.account_type,
-    subcategory: getSubcategory(row.kd_bbs),
-    normal_balance: row.normal_balance,
+  const supabaseAccounts: MasterBbs[] = (data as Array<Record<string, unknown>>).map((row) => ({
+    id: Number(row.id),
+    kd_bbs: String(row.kd_bbs),
+    nama_bbs: String(row.nama_bbs),
+    account_type: row.account_type as MasterBbs['account_type'],
+    subcategory: getSubcategory(String(row.kd_bbs)),
+    normal_balance: row.normal_balance as MasterBbs['normal_balance'],
     saldo_awal: Number(row.saldo_awal || 0),
     is_active: Boolean(row.is_active),
   }));
@@ -359,7 +366,6 @@ export async function fetchFinancialJournalsFromSupabase(
       startDate = '2026-01-01';
       endDate = '2026-01-31';
     } else if (periodFilter.length === 7 && periodFilter.startsWith('2026-')) {
-      const month = periodFilter.slice(5, 7);
       startDate = `${periodFilter}-01`;
       endDate = `${periodFilter}-31`;
     }
@@ -376,16 +382,17 @@ export async function fetchFinancialJournalsFromSupabase(
     return [];
   }
 
-  return data.map((row: any) => {
-    const rawLines = row.transaction_journal_line || [];
-    const lines: TransactionJournalLineItem[] = rawLines.map((l: any) => {
-      const mbbs = Array.isArray(l.master_bbs) ? l.master_bbs[0] : l.master_bbs;
+  return (data as Array<Record<string, unknown>>).map((row) => {
+    const rawLines = (row.transaction_journal_line || []) as Array<Record<string, unknown>>;
+    const lines: TransactionJournalLineItem[] = rawLines.map((l) => {
+      const rawMbbs = l.master_bbs;
+      const mbbs = (Array.isArray(rawMbbs) ? rawMbbs[0] : rawMbbs) as Record<string, string> | undefined;
       return {
-        id: l.id,
-        line_no: l.line_no,
+        id: Number(l.id),
+        line_no: Number(l.line_no),
         account_code: mbbs?.kd_bbs || '111-201',
-        account_name: mbbs?.nama_bbs || l.line_description || 'Akun GL',
-        line_description: l.line_description || row.description,
+        account_name: mbbs?.nama_bbs || (typeof l.line_description === 'string' ? l.line_description : 'Akun GL'),
+        line_description: String(l.line_description || row.description || ''),
         debit_amount: Number(l.debit_amount || 0),
         credit_amount: Number(l.credit_amount || 0),
         is_reconciled: Boolean(l.is_reconciled),
@@ -393,12 +400,12 @@ export async function fetchFinancialJournalsFromSupabase(
     });
 
     return {
-      id: row.id,
-      voucher_code: row.voucher_code,
-      transaction_date: row.transaction_date,
-      description: row.description,
-      total_amount: Number(row.total_amount),
-      status: row.status,
+      id: Number(row.id),
+      voucher_code: String(row.voucher_code || ''),
+      transaction_date: String(row.transaction_date || ''),
+      description: String(row.description || ''),
+      total_amount: Number(row.total_amount || 0),
+      status: String(row.status || 'POSTED') as TransactionJournalHeader['status'],
       lines: lines,
     };
   });

@@ -8,6 +8,7 @@ import {
   processBankWebhookBatchSecurely,
   createDefaultDatabaseClient,
   defaultIdempotencyStore,
+  isFiscalPeriodClosed,
   DatabaseClient,
   BankWebhookPayload,
 } from '@/lib/financial_service';
@@ -39,6 +40,8 @@ interface BankStatementRecord {
   idempotency_hash: string;
   source_channel: string;
   status: 'UNMATCHED';
+  compliance_flag?: 'FLAG_CLOSED_PERIOD' | 'NORMAL';
+  is_closed_period?: boolean;
 }
 
 /** Threshold to prevent connection pool exhaustion; batches > 50 are dispatched to worker queue */
@@ -95,6 +98,8 @@ export async function POST(request: NextRequest) {
       description: string;
       idempotencyHash: string;
       sourceChannel: string;
+      complianceFlag: 'FLAG_CLOSED_PERIOD' | 'NORMAL';
+      isClosed: boolean;
     }> = [];
 
     for (let index = 0; index < items.length; index++) {
@@ -135,6 +140,9 @@ export async function POST(request: NextRequest) {
         timestamp: now.toISOString(),
       });
 
+      const isClosed = isFiscalPeriodClosed(dateStr);
+      const complianceFlag: 'FLAG_CLOSED_PERIOD' | 'NORMAL' = isClosed ? 'FLAG_CLOSED_PERIOD' : 'NORMAL';
+
       hashAndMetadataList.push({
         bankAccountId,
         dateStr,
@@ -145,6 +153,8 @@ export async function POST(request: NextRequest) {
         description,
         idempotencyHash,
         sourceChannel: body.source_channel || 'N8N_TEST_WEBHOOK',
+        complianceFlag,
+        isClosed,
       });
     }
 
@@ -176,6 +186,8 @@ export async function POST(request: NextRequest) {
         idempotency_hash: meta.idempotencyHash,
         source_channel: meta.sourceChannel,
         status: 'UNMATCHED',
+        compliance_flag: meta.complianceFlag,
+        is_closed_period: meta.isClosed,
       };
     });
 
