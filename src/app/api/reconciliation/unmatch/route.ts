@@ -33,38 +33,56 @@ export async function POST(request: NextRequest) {
     // 1. Transactional Concurrency Control with SERIALIZABLE isolation & SELECT FOR UPDATE
     const result = await unmatchReconciliationGroupSecurely(cleanGroupId, reason, dbClient, operator);
 
-    // 2. Synchronize to Supabase with Distributed Transaction Atomicity & Compensating Actions
-    // If downstream Supabase update fails, triggers compensating rollback on the primary ledger to prevent split-brain state
+    // 2. Synchronize to Supabase with Distributed Transaction Atomicity & Single Atomic RPC
+    // Encapsulates all updates in a single database-side atomic transaction on Supabase via RPC
+    // to eliminate the vulnerability window for partial failures when dealing with high row counts.
     if (isSupabaseConfigured && supabase) {
       try {
-        // Revert bank statement lines to UNMATCHED
-        const { error: bankError } = await supabase
-          .from('bank_statement_line')
-          .update({ status: 'UNMATCHED', allocated_amount: 0 })
-          .eq('matched_group_id', cleanGroupId);
+        // Attempt single atomic RPC call first
+        const { error: rpcError } = await supabase.rpc('unmatch_reconciliation_group', {
+          p_group_id: cleanGroupId,
+        });
 
-        if (bankError) {
-          throw new Error(`Supabase bank_statement_line update failed: ${bankError.message}`);
-        }
+        if (rpcError) {
+          // If RPC function is not yet created on the database instance, fallback to sequenced updates
+          const isMissingRpc =
+            rpcError.code === 'PGRST202' ||
+            rpcError.message?.toLowerCase().includes('function') ||
+            rpcError.message?.toLowerCase().includes('not found');
 
-        // Revert journal lines to unreconciled
-        const { error: journalError } = await supabase
-          .from('transaction_journal_line')
-          .update({ is_reconciled: false })
-          .eq('matched_group_id', cleanGroupId);
+          if (isMissingRpc) {
+            // Revert bank statement lines to UNMATCHED
+            const { error: bankError } = await supabase
+              .from('bank_statement_line')
+              .update({ status: 'UNMATCHED', allocated_amount: 0 })
+              .eq('matched_group_id', cleanGroupId);
 
-        if (journalError) {
-          throw new Error(`Supabase transaction_journal_line update failed: ${journalError.message}`);
-        }
+            if (bankError) {
+              throw new Error(`Supabase bank_statement_line update failed: ${bankError.message}`);
+            }
 
-        // Remove reconciliation match
-        const { error: matchError } = await supabase
-          .from('bank_reconciliation_match')
-          .delete()
-          .eq('match_group_id', cleanGroupId);
+            // Revert journal lines to unreconciled
+            const { error: journalError } = await supabase
+              .from('transaction_journal_line')
+              .update({ is_reconciled: false })
+              .eq('matched_group_id', cleanGroupId);
 
-        if (matchError) {
-          throw new Error(`Supabase bank_reconciliation_match delete failed: ${matchError.message}`);
+            if (journalError) {
+              throw new Error(`Supabase transaction_journal_line update failed: ${journalError.message}`);
+            }
+
+            // Remove reconciliation match
+            const { error: matchError } = await supabase
+              .from('bank_reconciliation_match')
+              .delete()
+              .eq('match_group_id', cleanGroupId);
+
+            if (matchError) {
+              throw new Error(`Supabase bank_reconciliation_match delete failed: ${matchError.message}`);
+            }
+          } else {
+            throw new Error(`Supabase atomic RPC unmatch_reconciliation_group failed: ${rpcError.message}`);
+          }
         }
       } catch (syncError: unknown) {
         // Compensating action: revert primary ledger back to matched state to preserve distributed atomicity
