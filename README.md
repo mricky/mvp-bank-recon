@@ -1,4 +1,13 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# MVP Bank Reconciliation & AI Accounting Engine (Logistik Enterprise)
+
+Sistem ERP Modern Rekonsiliasi Bank Otomatis, Digitalisasi Faktur OCR AI, dan Pelaporan Finansial Standar PSAK / SAK EP untuk Industri Ekspedisi & Trucking.
+
+## 📚 Indeks Dokumentasi & Kepatuhan
+1. **[PANDUAN_PPH23_DAN_FAKTUR_PAJAK.md](file:///Users/hacaca/Projects/personal/levelUpSkill/mvp-bank-recon/PANDUAN_PPH23_DAN_FAKTUR_PAJAK.md)**: Panduan lengkap analisis, matriks skenario nyata operasional, regulasi PMK 71, validasi 16-digit NSFP, e-Bupot, dan rancangan smart-split rekonsiliasi PPh 23.
+2. **[ACCOUNTING_COMPLIANCE.md](file:///Users/hacaca/Projects/personal/levelUpSkill/mvp-bank-recon/ACCOUNTING_COMPLIANCE.md)**: Standar kepatuhan akuntansi, arsitektur basis data berprinsip ACID, hierarki Chart of Accounts (COA), dan prosedur tutup buku fiskal.
+3. **[PANDUAN_MEMBACA_LAPORAN_KEUANGAN.md](file:///Users/hacaca/Projects/personal/levelUpSkill/mvp-bank-recon/PANDUAN_MEMBACA_LAPORAN_KEUANGAN.md)**: Panduan eksekutif cara membaca Neraca, Laba Rugi, Arus Kas, dan rasio kesehatan finansial armada logistik.
+
+---
 
 ## Getting Started
 
