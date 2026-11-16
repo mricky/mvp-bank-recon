@@ -1,75 +1,137 @@
 /**
- * ⚠️ DEMO SERVICE: UNSECURED FINANCIAL TRANSACTION & RECONCILIATION WORKFLOW
- * Designed to test the Autonomous AI Architecture Gatekeeper.
+ * 🛡️ REFACTORED FINANCIAL TRANSACTION & RECONCILIATION SERVICE
  * 
- * VULNERABILITIES INTENTIONALLY INCLUDED:
- * 1. IEEE 754 Floating-Point arithmetic for financial balances (Precision drift).
- * 2. Unbalanced Double-Entry Journal Entry (Debits != Credits).
- * 3. Missing Idempotency Key & Row Locking (Race condition & double-credit vulnerability).
- * 4. Unindexed N+1 query loop across bank statement records.
+ * Previously contained demo vulnerabilities (Precision drift, Unbalanced journal,
+ * Missing idempotency, SQL injection, Race condition).
+ * 
+ * Refactored to production-ready enterprise standards:
+ * 1. BigInt minor units (sen/cents) - Zero IEEE 754 precision drift.
+ * 2. Strict Double-Entry validation (Debit === Credit).
+ * 3. Enforced Idempotency Key validation & replay protection.
+ * 4. Parameterized SQL queries & Row Locking (SELECT FOR UPDATE) to eliminate race conditions.
+ * 5. Strict TypeScript typing (Zero `any`).
  */
+
+import {
+  toCents,
+  fromCents,
+  JournalBuilder,
+  JournalEntry,
+  MissingIdempotencyKeyError,
+  DatabaseClient,
+  BankWebhookPayload,
+  WebhookProcessingResult,
+  defaultIdempotencyStore,
+} from './financial_service';
 
 export interface UnsecuredTransaction {
   id: string;
   accountNumber: string;
-  amount: number; // 🔴 Flaw: Raw float number instead of BigInt / integer cents
+  amount: number;
   direction: 'DEBIT' | 'CREDIT';
 }
 
-// 🔴 Flaw 1: Floating-point precision drift in money accumulation
-export function calculateAccountBalance(transactions: UnsecuredTransaction[]): number {
-  let totalBalance = 0.0;
+/**
+ * Calculates account balance with integer cents to eliminate IEEE 754 precision drift.
+ */
+export function calculateAccountBalance(transactions: readonly UnsecuredTransaction[]): number {
+  let totalBalanceCents = BigInt(0);
+
   for (const txn of transactions) {
+    const cents = toCents(txn.amount);
     if (txn.direction === 'CREDIT') {
-      totalBalance += txn.amount; // 🔴 Floating point addition accumulates rounding errors
+      totalBalanceCents += cents;
     } else {
-      totalBalance -= txn.amount;
+      totalBalanceCents -= cents;
     }
   }
-  return totalBalance; // Floating point leak: 0.1 + 0.2 !== 0.3
+
+  return fromCents(totalBalanceCents);
 }
 
-// 🔴 Flaw 2: Unbalanced double-entry journal creation (Debit != Credit)
-export function createUnbalancedJournalEntry(amount: number, fee: number) {
-  return {
-    referenceNo: `JRN-${Date.now()}`,
-    lines: [
-      {
-        accountCode: '1-1001',
-        accountName: 'Kas / Bank BCA',
-        debit: amount, // e.g. Rp 1.000.000
-        credit: 0
-      },
-      {
-        accountCode: '5-1001',
-        accountName: 'Beban Administrasi Bank',
-        debit: fee, // e.g. Rp 6.500
-        credit: 0
-      },
-      {
-        accountCode: '4-1001',
-        accountName: 'Pendapatan Layanan',
-        debit: 0,
-        credit: amount // 🔴 Flaw: Credit only matches amount, fee is orphaned! Total Debit (1.006.500) != Total Credit (1.000.000)
-      }
-    ]
-  };
+/**
+ * Creates a strictly balanced double-entry journal entry.
+ * Guarantees Total Debit === Total Credit.
+ */
+export function createUnbalancedJournalEntry(amount: number, fee: number): JournalEntry {
+  const grossCents = toCents(amount);
+  const feeCents = toCents(fee);
+
+  if (feeCents > grossCents) {
+    throw new Error('Fee cannot exceed the gross transaction amount.');
+  }
+
+  const netCents = grossCents - feeCents;
+
+  return new JournalBuilder(`JRN-${Date.now()}`, 'Penerimaan Pembayaran Pelanggan (Net Settlement)')
+    .addDebit('1-1001', 'Kas / Bank BCA', netCents, 'Penerimaan bersih masuk rekening')
+    .addDebit('5-1001', 'Beban Administrasi Bank', feeCents, 'Potongan biaya administrasi bank')
+    .addCredit('4-1001', 'Pendapatan Layanan', grossCents, 'Pendapatan kotor diakui seimbang')
+    .build();
 }
 
-// 🔴 Flaw 3: Missing idempotency check on bank webhook & no database row lock
-export async function processBankWebhook(payload: any, dbClient: any) {
+/**
+ * Securely processes bank webhooks:
+ * - Validates idempotency key (reference_id)
+ * - Uses parameterized queries to prevent SQL injection
+ * - Executes row-level locking (SELECT FOR UPDATE) to prevent race conditions
+ */
+export async function processBankWebhook(
+  payload: BankWebhookPayload,
+  dbClient: DatabaseClient
+): Promise<WebhookProcessingResult> {
   const { account_number, amount, reference_id } = payload;
 
-  // 🔴 Flaw: No check on reference_id (Missing idempotency guard)!
-  // 🔴 Flaw: Reading balance without SELECT ... FOR UPDATE (Race condition on concurrent webhooks)
-  const account = await dbClient.query(`SELECT balance FROM bank_accounts WHERE account_number = '${account_number}'`);
-  
-  const currentBalance = account.rows[0].balance;
-  const newBalance = currentBalance + amount;
+  if (!reference_id || typeof reference_id !== 'string' || reference_id.trim() === '') {
+    throw new MissingIdempotencyKeyError();
+  }
 
-  // 🔴 Flaw: Direct update without serializable transaction isolation or row locking
-  await dbClient.query(`UPDATE bank_accounts SET balance = ${newBalance} WHERE account_number = '${account_number}'`);
-  
-  return { success: true, newBalance };
+  const cleanReferenceId = reference_id.trim();
+
+  // Fast-path: check idempotency cache
+  const cached = await defaultIdempotencyStore.get(cleanReferenceId);
+  if (cached) {
+    return {
+      ...cached,
+      isIdempotentReplay: true,
+    };
+  }
+
+  const deltaCents = toCents(amount);
+
+  await dbClient.query('BEGIN');
+  try {
+    // 1. Parameterized Row-Locking query (Eliminates SQL Injection & Concurrent Race Conditions)
+    const selectSql = 'SELECT balance_in_cents FROM bank_accounts WHERE account_number = $1 FOR UPDATE';
+    const account = await dbClient.query<{ balance_in_cents: string | number }>(selectSql, [account_number]);
+
+    if (!account.rows || account.rows.length === 0) {
+      throw new Error(`Bank account '${account_number}' not found.`);
+    }
+
+    const currentBalanceCents = BigInt(account.rows[0].balance_in_cents);
+    const newBalanceCents = currentBalanceCents + deltaCents;
+
+    // 2. Parameterized Update query
+    const updateSql = 'UPDATE bank_accounts SET balance_in_cents = $1, updated_at = NOW() WHERE account_number = $2';
+    await dbClient.query(updateSql, [newBalanceCents.toString(), account_number]);
+
+    await dbClient.query('COMMIT');
+
+    const result: WebhookProcessingResult = {
+      success: true,
+      isIdempotentReplay: false,
+      referenceId: cleanReferenceId,
+      accountNumber: account_number,
+      newBalanceInCents: newBalanceCents,
+      newBalanceFormatted: (Number(newBalanceCents) / 100).toLocaleString('id-ID'),
+      processedAt: new Date().toISOString(),
+    };
+
+    await defaultIdempotencyStore.set(cleanReferenceId, result);
+    return result;
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    throw err;
+  }
 }
-
